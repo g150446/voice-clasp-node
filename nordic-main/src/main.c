@@ -44,6 +44,7 @@
 #include <zephyr/bluetooth/services/bas.h>
 #include <zephyr/dfu/mcuboot.h>
 #include <zephyr/sys/poweroff.h>
+#include <zephyr/sys/reboot.h>
 
 #include <hal/nrf_power.h>
 #include <math.h>
@@ -217,10 +218,31 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
  */
 #define EVT_BOOT_REPORT                0xD3
 
+/* Ack for CMD_REBOOT_BOOTLOADER: [00][55][D4][mode][accepted].
+ * mode 1 = Adafruit UF2 bootloader. accepted 0 means the request was refused
+ * (currently: a recording is in progress). Sent before the reboot work runs, so
+ * the host knows whether to start waiting for the mass-storage volume. */
+#define EVT_REBOOT_ACK                 0xD4
+
 /* Host-driven IMU register poke, so tap tuning does not need an OTA per try.
  * Writes are restricted to the tap/ODR registers listed in tap_reg_writable(). */
 #define CMD_IMU_REG_WRITE              0x50
 #define CMD_IMU_REG_READ               0x51
+
+/* Reboot into the Adafruit UF2 bootloader: [0x60][0xB0][0x07].
+ * MCUboot lives at 0x27000 and is not reachable over MCUmgr -- only the app's
+ * secondary slot is -- so changing it needs a UF2 write, and the only documented
+ * way in was a double-tap of the reset button (the 1200-baud trigger is not
+ * implemented by Zephyr's CDC ACM, and serial DFU needs the nRF5 SDK protocol).
+ * The two magic bytes are deliberate: audio_rx_write() has no unknown-command
+ * branch and 0x00-0x07 are all no-argument commands, so a bare byte would be far
+ * too easy to hit by accident for something this disruptive. */
+#define CMD_REBOOT_BOOTLOADER          0x60
+#define REBOOT_MAGIC_1                 0xB0
+#define REBOOT_MAGIC_2                 0x07
+/* Adafruit bootloader DFU_MAGIC_UF2_RESET, read out of GPREGRET at boot. */
+#define BOOTLOADER_MAGIC_UF2           0x57
+
 #define LSM6DS3TR_C_REG_CTRL10_C       0x19
 
 /*
@@ -562,6 +584,12 @@ static struct k_work_delayable adv_work;
  * bt_conn_le_param_update() is called from the system workqueue (not from
  * inside a BT/GATT callback where the BT lock is already held). */
 static struct k_work_delayable conn_param_work;
+
+/* Deferred reboot into the Adafruit UF2 bootloader (RX 0x60 / serial 'b').
+ * Deferred for two reasons: sys_reboot() must not run on the BT RX thread, and
+ * notify_one() only queues the ack -- the packet is not on air until
+ * ctrl_notify_done() fires, so resetting synchronously would swallow it. */
+static struct k_work_delayable reboot_work;
 
 static bool primary_conn_should_be_fast(void)
 {
@@ -1288,6 +1316,7 @@ static void send_gesture_detect_status(void);
 static bool gesture_capture_effective(void);
 static void send_gesture_capture_status(void);
 static void notify_all_conns(const void *data, uint16_t len);
+static int notify_one(struct bt_conn *conn, const void *data, uint16_t len);
 
 /* ============================================================================
  * Motion Detection
@@ -3692,6 +3721,22 @@ static ssize_t audio_rx_write(struct bt_conn *conn, const struct bt_gatt_attr *a
                 printk(">>> Host IMU collection rejected: busy\n");
             }
 #endif
+        } else if (data[0] == CMD_REBOOT_BOOTLOADER && len >= 3 &&
+                   data[1] == REBOOT_MAGIC_1 && data[2] == REBOOT_MAGIC_2) {
+            bool accepted = !(is_recording || recording_requested);
+            uint8_t ack[5] = { 0x00, 0x55, EVT_REBOOT_ACK, 1,
+                               accepted ? 1 : 0 };
+
+            printk(">>> Reboot to bootloader requested: %s\n",
+                   accepted ? "accepted" : "REFUSED (recording)");
+            notify_one(conn, ack, sizeof(ack));
+
+            if (accepted) {
+                /* Long enough for the ack to actually reach the air: the
+                 * connection is at the 30-50 ms idle interval and notify_one()
+                 * only queues the packet. */
+                k_work_schedule(&reboot_work, K_MSEC(500));
+            }
         }
     }
 
@@ -4826,6 +4871,7 @@ static void adv_work_handler(struct k_work *work)
  * Serial command thread — reads from USB CDC ACM UART
  *   'r' → recording start
  *   's' → recording stop
+ *   'b' → reboot into the UF2 bootloader (same path as RX 0x60)
  * ============================================================================ */
 
 static void serial_cmd_thread(void *p1, void *p2, void *p3)
@@ -4838,7 +4884,7 @@ static void serial_cmd_thread(void *p1, void *p2, void *p3)
         return;
     }
 
-    printk(">>> Serial command thread ready ('r'=start 's'=stop)\n");
+    printk(">>> Serial command thread ready ('r'=start 's'=stop 'b'=bootloader)\n");
 
     while (true) {
         unsigned char ch;
@@ -4851,6 +4897,16 @@ static void serial_cmd_thread(void *p1, void *p2, void *p3)
             } else if (ch == 's' || ch == 'S') {
                 printk(">>> SERIAL: recording stop\n");
                 stop_requested = true;
+            } else if (ch == 'b' || ch == 'B') {
+                if (is_recording || recording_requested) {
+                    printk(">>> SERIAL: bootloader REFUSED (recording)\n");
+                } else {
+                    printk(">>> SERIAL: reboot to bootloader\n");
+                    /* Via the work item rather than inline so both entry points
+                     * take the same path, and so this thread's printk can drain
+                     * before the reset. */
+                    k_work_schedule(&reboot_work, K_MSEC(500));
+                }
             }
         } else {
             k_msleep(20);
@@ -5109,6 +5165,36 @@ restore_adv:
     unconnected_since_ms = k_uptime_get();
 }
 
+/* Hand the device over to the Adafruit UF2 bootloader, which reads GPREGRET at
+ * boot and stays in mass-storage mode when it finds the magic.
+ *
+ * Requires USB to be connected: with no VBUS the bootloader does not stay in DFU
+ * mode at all and falls straight through to the app.
+ *
+ * On the watchdog: the nRF52840 WDT has no STOP task, so it cannot be turned
+ * off, and a soft reset does not clear it -- only a pin reset, POR, or SYSTEMOFF
+ * wake does. The bootloader therefore inherits a running watchdog, which the
+ * manual double-tap route (a pin reset) never had to deal with. Measured on
+ * bootloader 0.6.2-12-g459adc9: it feeds the dog itself and the volume stays up
+ * indefinitely, which matters because a 1.44 MB write can take 16 s against a
+ * 12 s WDT_TIMEOUT_MS. Feed it here anyway so the handover starts from a full
+ * window rather than a partly spent one. */
+static void reboot_work_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+
+    printk(">>> Rebooting into UF2 bootloader (GPREGRET=0x%02x)\n",
+           BOOTLOADER_MAGIC_UF2);
+
+    if (wdt_channel_id >= 0) {
+        wdt_feed(wdt, wdt_channel_id);
+    }
+    (void)bt_le_adv_stop();
+
+    nrf_power_gpregret_set(NRF_POWER, 0, BOOTLOADER_MAGIC_UF2);
+    sys_reboot(SYS_REBOOT_COLD);
+}
+
 /* ============================================================================
  * Main
  * ============================================================================ */
@@ -5162,6 +5248,7 @@ int main(void)
 
     k_work_init_delayable(&adv_work, adv_work_handler);
     k_work_init_delayable(&conn_param_work, conn_param_work_handler);
+    k_work_init_delayable(&reboot_work, reboot_work_handler);
 
     ret = bt_enable(NULL);
     if (ret) { LOG_ERR("BLE enable failed: %d", ret); return ret; }

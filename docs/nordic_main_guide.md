@@ -133,12 +133,27 @@ west build -p always --sysbuild -b xiao_ble/nrf52840/sense \
 
 ### RX コマンド（ホスト → ファームウェア）
 
+RX write は **素のバイト列**で、`data[0]` がコマンド。`[0x00][0x55]` フレームは TX 専用なので
+RX には付けない（`mac_client/tap_monitor.py` の `bytes([0x50, reg, val])` が実例）。
+
 | バイト値 | 動作 |
 |---------|------|
 | `0x01` | 録音開始。既に録音中なら停止→再開始（ホストの状態ずれ救済、`0.0.97+`） |
 | `0x00` | 録音停止 |
+| `0x02` | プライマリ（音声受信）役を宣言する。`conn_param_work` を再スケジュール |
+| `0x03` | プライマリ役をもう一方の接続へ譲る |
+| `0x04` | IMU 軌跡のホスト収集を開始（`GESTURE_DEBUG_HISTORY` ビルドのみ） |
+| `0x05 [mode]` | 動作モード `0x00`=通常 / `0x01`=運転中（`0x40`で応答） |
+| `0x06 [en]` | IMU 軌跡収集スイッチ（既定 OFF。`0x39`で応答） |
+| `0x07 [en]` | ジェスチャー検出スイッチ（既定 OFF。`0x3A`で応答） |
 | `0x50 [reg] [val]` | IMUレジスタ書き込み（タップ関連のみ許可。`0xD2`で応答） |
 | `0x51 [reg]` | IMUレジスタ読み出し（`0xD2`で応答） |
+| `0x60 0xB0 0x07` | **UF2 ブートローダで再起動**（`0.0.106+`。`0xD4`で応答） |
+
+`0x60` のマジック 2 バイトは誤爆防止。`audio_rx_write()` には未知コマンドの分岐が無く
+`0x00`–`0x07` が引数なしなので、破壊的なコマンドを単バイトにすると事故りやすい。
+**録音中は拒否**し、`0xD4` の `accepted` に 0 を載せて返す。詳細は下の
+「UF2 ブートローダへ再起動する」。
 
 `0x50` / `0x51` はタップ調整用の診断コマンド。書き込みは `CTRL1_XL` `CTRL6_C`
 `CTRL10_C` `TAP_CFG` `TAP_THS_6D` `INT_DUR2` `WAKE_UP_THS` `MD1_CFG` に限定され、
@@ -180,6 +195,8 @@ west build -p always --sysbuild -b xiao_ble/nrf52840/sense \
 | `0xD0` | `tap_diag` | read_ret i8 + CTRL1_XL/CTRL6_C/TAP_CFG/TAP_THS_6D/INT_DUR2/WAKE_UP_THS/MD1_CFG/INT1_CTRL u8 + nonzero_count u16 LE + int1_level i8 | タップ関連レジスタのスナップショット（接続確立時に1回。任意タイミングの個別読み出しは RX `0x51` → `0xD2`） |
 | `0xD1` | `tap_src_raw` | TAP_SRC u8 + read_ret i8 | 判定に使った生の `TAP_SRC`。タップ1回につき1パケット |
 | `0xD2` | `imu_reg_ack` | reg u8 + 読み戻し値 u8 + ret i8 | RX `0x50` / `0x51` への応答 |
+| `0xD3` | `boot_report` | cause u32 LE + crash_valid u8 + stage u8 + prev_up_s u16 LE + hb u16 LE + ndrop u16 LE | 接続ごとに greeting の先頭で1回。`0.0.103+`。読み方は「起動レポート `0xD3`」 |
+| `0xD4` | `reboot_ack` | mode u8（1=UF2 ブートローダ） + accepted u8 | RX `0x60` への応答。`accepted=0` は録音中による拒否。`0.0.106+` |
 
 ---
 
@@ -724,6 +741,38 @@ Device reset. MCUboot will swap slots on next boot.
 Waiting for the updated device to return...
 OTA verified: uploaded image is active and confirmed in slot 0 (version=...).
 ```
+
+#### UF2 ブートローダへ再起動する（`0.0.106+`）
+
+MCUboot を書き換えるには UF2 が要るが、その入口はリセットボタンのダブルタップしか無かった。
+1200 baud トリガーは Zephyr の CDC ACM が未実装、`adafruit-nrfutil dfu serial` はアプリ側が
+nRF5 SDK の DFU プロトコルを持たないため使えない（`nrf52_porting_lessons.md`）。
+残る `GPREGRET = 0x57` + ソフトリセットをコマンド化したのがこれ。
+
+```bash
+# BLE 経由（USB を挿しておくこと）。.uf2 を渡すとマウント検知後そのまま書き込む
+mac_client/venv/bin/python3 mac_client/enter_bootloader.py /tmp/flash_0106.uf2
+
+# シリアル経由（'b' を送るだけ）
+printf 'b' > /dev/cu.usbmodem101
+```
+
+**USB を挿しておくこと。** VBUS が無いとブートローダは DFU モードに留まらずアプリへ素通りする
+（実測：USB 無しだと `0xD3` の reset cause が `SOFTWARE` のままアプリが再起動する）。
+
+実測した挙動：
+
+| 項目 | 結果 |
+|---|---|
+| ダブルタップ | **不要**。コマンド送信から数秒で `XIAO-SENSE` がマウント |
+| ブートローダの生存時間 | **制限なし**（60 秒経過しても維持）。ブートローダが自分でウォッチドッグに給餌している |
+| UF2 書き込み | 1.44 MB で 3.6〜16.5 秒。完了時の `Input/output error` は正常（受領即リブート） |
+
+ウォッチドッグについて補足：nRF52840 の WDT は `WDT_TASKS_STOP` が無く**ソフトで停止できない**。
+止まるのは POR / ブラウンアウト / **ピンリセット** / SYSTEMOFF 復帰のみで、`sys_reboot()` は
+ソフトリセットなので armed のまま引き継がれる。ダブルタップ（ピンリセット）では
+WDT がクリアされるという非対称性があるため、このコマンド経由ではブートローダが
+給餌してくれることに依存している（上表のとおり実測で確認済み）。
 
 #### スワップ中の MCUboot ウォッチドッグ（`0.0.104+`）
 
