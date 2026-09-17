@@ -38,6 +38,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/atomic.h>
+#include <zephyr/sys/byteorder.h>
 #include <zephyr/drivers/uart.h>
 #include <zephyr/usb/usb_device.h>
 #include <zephyr/bluetooth/services/bas.h>
@@ -196,6 +197,25 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 #define EVT_TAP_DIAG                   0xD0
 #define EVT_TAP_SRC_RAW                0xD1
 #define EVT_TAP_REG_ACK                0xD2
+
+/*
+ * Boot report, sent once per connection with the greeting.
+ *
+ * A watchdog reset and a plain radio-side link loss look identical from the
+ * peer: both surface as HCI 0x08 / Android status=8. Telling them apart used
+ * to need the USB serial log, which is exactly what is unavailable when the
+ * device is being worn. The Android app already prints every unrecognised TX
+ * event as hex, so publishing the reset cause and the crash box here makes the
+ * previous boot readable straight out of logcat with no app change.
+ *
+ *   [00][55][D3][cause u32][crash_valid][stage][prev_up_s u16][hb u16][ndrop u16]
+ *
+ * prev_up_s / hb / ndrop describe the run that died; they are zero unless
+ * crash_valid is 1. A reconnect whose report repeats the previous cause and
+ * carries crash_valid=0 means the firmware never restarted -- the link alone
+ * dropped.
+ */
+#define EVT_BOOT_REPORT                0xD3
 
 /* Host-driven IMU register poke, so tap tuning does not need an OTA per try.
  * Writes are restricted to the tap/ODR registers listed in tap_reg_writable(). */
@@ -1026,6 +1046,15 @@ struct crashbox {
 
 static __noinit struct crashbox cb;
 
+/* Snapshot taken at boot, before log_reset_cause() clears the hardware cause
+ * and re-arms the crash box. Published to every client as EVT_BOOT_REPORT. */
+static uint32_t boot_reset_cause;
+static bool     boot_crash_valid;
+static uint8_t  boot_crash_stage;
+static uint16_t boot_crash_up_s;
+static uint16_t boot_crash_hb;
+static uint16_t boot_crash_ndrop;
+
 /* Mark where the main loop is before anything that can block. */
 static inline void loop_stage(loop_stage_t stage)
 {
@@ -1050,7 +1079,14 @@ static void log_reset_cause(void)
     if (cause == 0)               printk(" [POR — power-on / battery removed]");
     printk("\n");
 
+    boot_reset_cause = cause;
+
     if (cb.magic == CRASHBOX_MAGIC && !(cause & RESET_LOW_POWER_WAKE)) {
+        boot_crash_valid = true;
+        boot_crash_stage = cb.stage;
+        boot_crash_up_s  = (uint16_t)MIN(cb.up_s, 0xFFFFU);
+        boot_crash_hb    = (uint16_t)MIN(cb.hb_seq, 0xFFFFU);
+        boot_crash_ndrop = (uint16_t)MIN(cb.ndrop, 0xFFFFU);
         printk(">>> CRASHBOX stage=%u(%s) up=%us hb=%u conns=%u rec=%u ndrop=%u\n",
                cb.stage, stage_str(cb.stage), cb.up_s, cb.hb_seq,
                cb.conns, cb.recording, cb.ndrop);
@@ -3867,6 +3903,30 @@ static void send_tap_reg_ack(uint8_t reg, uint8_t value, int ret)
 /* Deliver the per-connection greeting once that client has subscribed.  Polled
  * from the main loop; see conn_needs_greeting for why this cannot be event
  * driven. */
+/* Boot report: [00][55][D3][cause u32 LE][crash_valid][stage]
+ *              [prev_up_s u16 LE][hb u16 LE][ndrop u16 LE]
+ * See EVT_BOOT_REPORT for how to read it. */
+static void send_boot_report(struct bt_conn *conn)
+{
+    uint8_t pkt[15];
+
+    pkt[0] = 0x00;
+    pkt[1] = 0x55;
+    pkt[2] = EVT_BOOT_REPORT;
+    sys_put_le32(boot_reset_cause, &pkt[3]);
+    pkt[7] = boot_crash_valid ? 1 : 0;
+    pkt[8] = boot_crash_stage;
+    sys_put_le16(boot_crash_up_s, &pkt[9]);
+    sys_put_le16(boot_crash_hb, &pkt[11]);
+    sys_put_le16(boot_crash_ndrop, &pkt[13]);
+
+    notify_one(conn, pkt, sizeof(pkt));
+    printk(">>> boot_report cause=0x%08x crash=%u stage=%u(%s) prev_up=%us hb=%u ndrop=%u\n",
+           boot_reset_cause, boot_crash_valid, boot_crash_stage,
+           stage_str(boot_crash_stage), boot_crash_up_s, boot_crash_hb,
+           boot_crash_ndrop);
+}
+
 static void send_pending_greetings(void)
 {
     for (int i = 0; i < MAX_CONNS; i++) {
@@ -3878,6 +3938,10 @@ static void send_pending_greetings(void)
             continue;
         }
         conn_needs_greeting[i] = false;
+
+        /* First, so it is the anchor line in logcat for this connection:
+         * why the firmware last restarted, and where it was when it died. */
+        send_boot_report(connections[i]);
 
         uint8_t pkt[5] = {0x00, 0x55, EVT_OPERATION_MODE,
                           operation_mode, operation_mode_pending};

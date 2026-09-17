@@ -327,6 +327,39 @@ SYSTEMOFF に落ちる。
   20 ms で取れなければ**捨てる**。犬に餌をやるスレッドは絶対に止めない
 - `CONFIG_BT_ATT_TX_COUNT` 8 → 12（音声 6 ＋ 制御 4 ＋ MCUmgr 用 2）
 
+#### 起動レポート `0xD3`（`0.0.103+`）— USB なしで原因を判別する
+
+ウォッチドッグリセットと純粋なリンク断は、**相手からは区別できない**（どちらも
+HCI `0x08` / Android `status=8`）。区別にはシリアルが要るが、装着運用中はまさに
+その USB が無い。
+
+Android アプリは**未知の TX イベントを hex のまま logcat に出す**ので、FW 側から
+起動情報を流せば**アプリを一切変更せずに** logcat で読める。接続ごとに greeting の
+先頭で 1 回送る。
+
+```
+[00][55][D3][cause u32 LE][crash_valid][stage][prev_up_s u16][hb u16][ndrop u16]
+```
+
+| フィールド | 意味 |
+|---|---|
+| `cause` | `hwinfo_get_reset_cause()` の値。`0x01`=PIN、`0x02`=SOFTWARE、`0x10`=WATCHDOG、`0x80`=LOW_POWER_WAKE（SYSTEMOFF 復帰） |
+| `crash_valid` | 1 なら以下が前回の実行の値（`.noinit` のクラッシュボックスが生き残った） |
+| `stage` | 停止時のメインループ位置 1=motion 2=tap 3=greet 4=tapdiag 5=sleepnfy 6=battery |
+| `prev_up_s` | 死んだ実行の uptime 秒 |
+| `hb` | 死んだ実行の最後のハートビート番号 |
+| `ndrop` | 死んだ実行で捨てた制御通知の数 |
+
+読み方：
+
+- 再接続時のレポートが**前回と同じ `cause` で `crash_valid=0`** → FW は再起動していない。
+  **リンクだけが落ちた**（RF / 圏外）
+- `cause` に `0x10`（WATCHDOG）が立ち `crash_valid=1` → **ウォッチドッグリセット**。
+  `stage` がどこでブロックしたかを示す
+- `cause=0x80` → SYSTEMOFF から復帰した（タップで起こされた）
+
+logcat では `TX event 0xD3 (00 55 D3 ...)` として現れる。
+
 #### 診断ログ（`0.0.102+`）
 
 シリアルだけで「リンクが落ちた」と「デバイスがリセットした」を判別できる。
