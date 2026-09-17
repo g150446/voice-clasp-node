@@ -108,6 +108,8 @@ Silero VAD: rmsAfterDC=0.0012   ← ほぼ無音
 - **プライマリ接続**（音声データを受け取る側）: 録音中だけ 7.5 ms。それ以外は 30–50 ms（FW `0.0.100+`）
 - **セカンダリ接続**（イベント通知のみ）: 常に 100–150 ms
 - **supervision timeout / GAP PPCP**: すべて 8 s。idle 中に間隔を再更新しない
+- **ウォッチドッグ 12 s**（FW `0.0.102+`）: supervision より必ず長くすること。理由は下の
+  「supervision timeout をウォッチドッグより長くしてはいけない」
 
 ### 実装（`main.c`）
 
@@ -159,6 +161,40 @@ BT コールバック内から直接 `bt_conn_le_param_update()` を呼ぶと BT
 - **Android**: 7.5 ms–4000 ms は受け入れることが多い。GAP PPCP の timeout が短い（Zephyr 既定 420 ms）と、探索後にそれを採用して Connection Timeout（HCI 0x08）で切る。`prj.conf` で PPCP を idle（30–50 ms / 8 s）に合わせること
 - **macOS (CoreBluetooth)**: 15 ms–2000 ms 程度は受け入れる
 - **拒否された場合**: 既存のインターバルのまま動作する（切断にはならないとは限らない。timeout をセット間で変えない）
+
+#### ペリフェラルでは要求は即座に送られない（`0.0.102` でログを訂正）
+
+`bt_conn_le_param_update()` はペリフェラルでは **何も送信せず**、
+`conn->interval_min/max` 等を保存して `BT_CONN_PERIPHERAL_PARAM_SET` を立てて
+`0` を返すだけ（`host/conn.c`）。実際の送信は接続確立時に仕込まれた
+`conn->deferred_work` が **T+5 s** に 1 回行う。
+
+- `0.0.100` までのログ `>>> conn_param_update[i]: idle(30ms)` は
+  **何も送っていない時点で出ていた**。`0.0.102` で
+  `>>> conn_param[i]: ... requested (host sends at T+5s)` に改めた
+- 受理されたかどうかの唯一の証拠は `>>> le_param_updated[i]`。
+  これが一度も出なければ、相手は要求を全部黙殺してリンクを自分のパラメータで
+  回している。`0.0.102` の `>>> DISCONN` は `params=...(never-updated)` でそれを示す
+- `CONFIG_BT_CONN_PARAM_RETRY_COUNT` 系は `BT_CONN_PERIPHERAL_PARAM_AUTO_UPDATE` が
+  立っているときだけ効く。アプリが自分で `bt_conn_le_param_update()` を呼ぶこの FW では
+  そのフラグは立たないので、**再送設定は死にコード**
+
+### supervision timeout をウォッチドッグより長くしてはいけない
+
+`0.0.100` が supervision を 4 s → 8 s に上げたことで、5 s のウォッチドッグより
+長くなり、「接続したまま放置すると切れてデバイスが消える」退行が出た。
+
+`bt_gatt_notify()` は ATT PDU を `K_FOREVER` で確保する（`host/att.c`。
+タイムアウトが付くのは response と confirmation だけ）。バッファは相手が
+LL ACK を返して初めて戻るので、**相手が黙るとメインループがそこで固まる**。
+
+- supervision < ウォッチドッグ … コントローラが先にリンクを切り、バッファが解放され、
+  ブロックが解けて餌やりが間に合う（`0.0.98`/`0.0.99` が偶然生き延びていた理由）
+- supervision > ウォッチドッグ … **必ずリセットする**。相手からは切断と区別できない
+
+`0.0.102` の不変条件: **`WDT_TIMEOUT_MS`（12 s）> supervision timeout（8 s）**。
+加えて制御系の通知は `notify_one()` の専用セマフォ経由にして、
+20 ms で枠が取れなければ捨てる（犬に餌をやるスレッドを止めない）。
 
 ---
 

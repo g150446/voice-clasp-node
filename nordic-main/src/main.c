@@ -67,12 +67,28 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 #define AUDIO_NOTIFY_DRAIN_TIMEOUT_MS 1000
 #define AUDIO_QUEUE_DRAIN_TIMEOUT_MS 500
 #define WDT_NODE                DT_NODELABEL(wdt0)
-#define WDT_TIMEOUT_MS          5000
+/* Must stay LONGER than the BLE supervision timeout (8 s, see conn_param_work).
+ * With 5 s the watchdog always won: a peer that stopped ACKing parked the main
+ * loop in bt_gatt_notify() and the SoC reset before the controller could drop
+ * the link and free the buffers.  0.0.98/0.0.99 survived only because their
+ * supervision timeout was 4 s, i.e. below the old 5 s dog. */
+#define WDT_TIMEOUT_MS          12000
 #define MAIN_LOOP_INTERVAL_MS   25
 #define ERROR_BLINK_MS          200
 #define ADV_LED_ON_MS           200
 #define ADV_LED_OFF_MS          1800
-#define ADV_NO_CONN_SLEEP_MS    (3 * 60 * 1000)  /* unconnected this long → SYSTEMOFF */
+/* Unconnected this long → SYSTEMOFF.  Two tiers: a peer that was connected and
+ * went away is probably coming back (Doze, out of range, app restart), and
+ * sleeping after 3 min turned every transient drop into "the device is gone
+ * until someone double-taps it". */
+#define ADV_NO_CONN_SLEEP_MS     (3 * 60 * 1000)   /* cold boot / after tap wake */
+#define ADV_AFTER_DROP_SLEEP_MS  (30 * 60 * 1000)  /* after losing a peer */
+#define ADV_LOW_BATT_PCT         15   /* below this, sleep on the short fuse */
+#define HEARTBEAT_INTERVAL_MS    30000
+#define MAIN_LOOP_STALL_WARN_MS  500
+/* Fast advertising is kept this long after the connection count changes so a
+ * second client (Mac) is still found quickly; after that it drops to slow. */
+#define ADV_FAST_BURST_MS        30000
 #define BATTERY_POLL_INTERVAL_MS 60000  /* 1 minute */
 #define BATTERY_CAPACITY_MAH        40   /* LiPo capacity in mAh */
 #define BATTERY_CHARGE_CURRENT_MA  100   /* BQ25120 charge current on XIAO nRF52840 */
@@ -462,6 +478,16 @@ static uint8_t seq_num;
 static volatile bool is_recording;
 static bool ble_primary_want_fast;
 static int64_t unconnected_since_ms;
+/* true once any peer has connected since boot / since the last SYSTEMOFF wake:
+ * selects the long SYSTEMOFF fuse so a transient drop is not fatal. */
+static bool had_conn_this_cycle;
+static int64_t last_recording_stop_ms;
+/* Per-slot diagnosis state, printed on disconnect. */
+static int64_t conn_started_ms[MAX_CONNS];
+static uint16_t conn_param_interval[MAX_CONNS];
+static uint16_t conn_param_latency[MAX_CONNS];
+static uint16_t conn_param_timeout[MAX_CONNS];
+static bool conn_param_seen[MAX_CONNS];
 static volatile bool recording_requested;
 static volatile bool stop_requested;
 static volatile bool capture_enabled;
@@ -578,11 +604,15 @@ static void conn_param_work_handler(struct k_work *work)
             p = &slow_param;
             label = "slow(100ms)";
         }
+        /* On a peripheral this only records the request: the host sends it
+         * from conn->deferred_work ~5 s after connect. Nothing is on air yet,
+         * and le_param_updated() is the only proof it was accepted. */
         int ret = bt_conn_le_param_update(connections[i], p);
-        if (ret && ret != -EALREADY) {
-            printk(">>> conn_param_update[%d] failed: %d\n", i, ret);
+        if (ret) {
+            printk(">>> conn_param[%d] request failed: %d\n", i, ret);
         } else {
-            printk(">>> conn_param_update[%d]: %s\n", i, label);
+            printk(">>> conn_param[%d]: %s requested (host sends at T+5s)\n",
+                   i, label);
         }
     }
 }
@@ -952,6 +982,56 @@ static void led_tick(void)
  * Reset Cause & Watchdog
  * ============================================================================ */
 
+/* ---------------------------------------------------------------------------
+ * Crash box — survives a watchdog / soft reset so the next boot can say where
+ * the main loop was when it stopped feeding the dog.  Lives in .noinit, so it
+ * is garbage after a power-on reset and after a SYSTEMOFF wake; the magic word
+ * filters both (SYSTEMOFF wake is already reported as RESET_LOW_POWER_WAKE).
+ * --------------------------------------------------------------------------- */
+#define CRASHBOX_MAGIC 0x48424f58u  /* "HBOX" */
+
+typedef enum {
+    STAGE_IDLE = 0,
+    STAGE_MOTION,
+    STAGE_TAP,
+    STAGE_GREET,
+    STAGE_TAPDIAG,
+    STAGE_SLEEPNFY,
+    STAGE_BATTERY,
+} loop_stage_t;
+
+static const char *stage_str(uint8_t stage)
+{
+    switch (stage) {
+    case STAGE_IDLE:     return "idle";
+    case STAGE_MOTION:   return "motion";
+    case STAGE_TAP:      return "tap";
+    case STAGE_GREET:    return "greet";
+    case STAGE_TAPDIAG:  return "tapdiag";
+    case STAGE_SLEEPNFY: return "sleepnfy";
+    case STAGE_BATTERY:  return "battery";
+    default:             return "?";
+    }
+}
+
+struct crashbox {
+    uint32_t magic;
+    uint32_t up_s;
+    uint32_t hb_seq;
+    uint32_t ndrop;
+    uint8_t  stage;
+    uint8_t  conns;
+    uint8_t  recording;
+};
+
+static __noinit struct crashbox cb;
+
+/* Mark where the main loop is before anything that can block. */
+static inline void loop_stage(loop_stage_t stage)
+{
+    cb.stage = (uint8_t)stage;
+}
+
 static void log_reset_cause(void)
 {
     uint32_t cause = 0;
@@ -969,6 +1049,16 @@ static void log_reset_cause(void)
     if (cause & RESET_LOW_POWER_WAKE) printk(" [LOW_POWER_WAKE — SYSTEMOFF]");
     if (cause == 0)               printk(" [POR — power-on / battery removed]");
     printk("\n");
+
+    if (cb.magic == CRASHBOX_MAGIC && !(cause & RESET_LOW_POWER_WAKE)) {
+        printk(">>> CRASHBOX stage=%u(%s) up=%us hb=%u conns=%u rec=%u ndrop=%u\n",
+               cb.stage, stage_str(cb.stage), cb.up_s, cb.hb_seq,
+               cb.conns, cb.recording, cb.ndrop);
+    } else {
+        printk(">>> CRASHBOX: none (cold boot or SYSTEMOFF wake)\n");
+    }
+    memset(&cb, 0, sizeof(cb));
+    cb.magic = CRASHBOX_MAGIC;
 }
 
 static void configure_watchdog(void)
@@ -3631,6 +3721,70 @@ static void send_gesture_detect_status(void)
     notify_all_conns(pkt, sizeof(pkt));
 }
 
+/* ---------------------------------------------------------------------------
+ * Bounded control-plane notify
+ *
+ * bt_gatt_notify() allocates its ATT PDU with K_FOREVER: att.c gives a timeout
+ * only to ATT_RESPONSE and ATT_CONFIRMATION, so a notification waits forever.
+ * The buffers come from the att_pool shared by every notify in the system and
+ * are released only once the packet reaches the controller, which needs an ACL
+ * credit, which comes back only after the peer link-layer-ACKs.  A peer that
+ * goes quiet therefore parks the caller indefinitely.
+ *
+ * The main loop is the only thing feeding the watchdog and it notifies from six
+ * different places (motion, tap, greetings, tap diag, light-sleep events,
+ * battery) plus the debug trajectory dumps, so it must never take that path.
+ * Reserve a small slice of the pool for control traffic and drop instead of
+ * blocking when the slice is exhausted.
+ *
+ * Budget: BT_ATT_TX_COUNT=12 = AUDIO_NOTIFY_IN_FLIGHT(6) + CTRL(4) + 2 spare
+ * for the MCUmgr SMP transport during OTA.
+ * --------------------------------------------------------------------------- */
+#define CTRL_NOTIFY_IN_FLIGHT   4
+#define CTRL_NOTIFY_WAIT_MS     20
+
+K_SEM_DEFINE(ctrl_notify_slots, CTRL_NOTIFY_IN_FLIGHT, CTRL_NOTIFY_IN_FLIGHT);
+static uint32_t ctrl_notify_dropped;
+
+static void ctrl_notify_done(struct bt_conn *conn, void *user_data)
+{
+    ARG_UNUSED(conn);
+    ARG_UNUSED(user_data);
+    k_sem_give(&ctrl_notify_slots);
+}
+
+/* Drop-in replacement for bt_gatt_notify() on the control characteristic.
+ * Returns 0 on success, -EAGAIN when the slice was busy (packet dropped). */
+static int notify_one(struct bt_conn *conn, const void *data, uint16_t len)
+{
+    struct bt_gatt_notify_params params;
+    int err;
+
+    if (!conn) {
+        return -ENOTCONN;
+    }
+    if (k_sem_take(&ctrl_notify_slots, K_MSEC(CTRL_NOTIFY_WAIT_MS)) != 0) {
+        ctrl_notify_dropped++;
+        return -EAGAIN;
+    }
+
+    memset(&params, 0, sizeof(params));
+    params.attr = &audio_svc.attrs[2];
+    params.data = data;
+    params.len  = len;
+    params.func = ctrl_notify_done;
+
+    err = bt_gatt_notify_cb(conn, &params);
+    if (err) {
+        /* func is not called when the request never got queued. */
+        k_sem_give(&ctrl_notify_slots);
+        if (err != -ENOTCONN && err != -EINVAL) {
+            ctrl_notify_dropped++;
+        }
+    }
+    return err;
+}
+
 /* Notify every active BLE client. Tap/diagnostic events must reach Android even
  * when Mac Handy holds the primary (audio) role. */
 static void notify_all_conns(const void *data, uint16_t len)
@@ -3641,7 +3795,7 @@ static void notify_all_conns(const void *data, uint16_t len)
         if (!connections[i]) {
             continue;
         }
-        if (bt_gatt_notify(connections[i], &audio_svc.attrs[2], data, len) == 0) {
+        if (notify_one(connections[i], data, len) == 0) {
             n++;
         }
     }
@@ -3669,7 +3823,7 @@ static void send_event_packet(uint8_t event_code)
         return;
     }
     printk(">>> send_event 0x%02x -> primary[%d]\n", event_code, primary_idx);
-    bt_gatt_notify(get_primary_conn(), &audio_svc.attrs[2], pkt, sizeof(pkt));
+    notify_one(get_primary_conn(), pkt, sizeof(pkt));
 }
 
 /* Tap register snapshot: [0x00][0x55][0xD0][ret][CTRL1_XL][CTRL6_C][TAP_CFG]
@@ -3727,17 +3881,17 @@ static void send_pending_greetings(void)
 
         uint8_t pkt[5] = {0x00, 0x55, EVT_OPERATION_MODE,
                           operation_mode, operation_mode_pending};
-        bt_gatt_notify(connections[i], &audio_svc.attrs[2], pkt, sizeof(pkt));
+        notify_one(connections[i], pkt, sizeof(pkt));
 
         /* Capture and detect live in RAM and a reset clears them, so state the
          * truth here rather than leaving the host to assume last request. */
         uint8_t cap[4] = {0x00, 0x55, EVT_GESTURE_CAPTURE,
                           gesture_capture_effective() ? 1 : 0};
-        bt_gatt_notify(connections[i], &audio_svc.attrs[2], cap, sizeof(cap));
+        notify_one(connections[i], cap, sizeof(cap));
 
         uint8_t det[4] = {0x00, 0x55, EVT_GESTURE_DETECT,
                           gesture_detect_effective() ? 1 : 0};
-        bt_gatt_notify(connections[i], &audio_svc.attrs[2], det, sizeof(det));
+        notify_one(connections[i], det, sizeof(det));
         printk(">>> Greeted conn[%d]: mode=%u capture=%u detect=%u\n", i,
                operation_mode, cap[3], det[3]);
 
@@ -3766,7 +3920,7 @@ static void send_event_packet_xyz(uint8_t event_code, float x, float y, float z)
     memcpy(&pkt[3],  &x, 4);
     memcpy(&pkt[7],  &y, 4);
     memcpy(&pkt[11], &z, 4);
-    bt_gatt_notify(get_primary_conn(), &audio_svc.attrs[2], pkt, sizeof(pkt));
+    notify_one(get_primary_conn(), pkt, sizeof(pkt));
 }
 
 /* Gesture diagnostic packet:
@@ -3792,7 +3946,7 @@ static void send_gesture_diag(uint8_t stage, uint8_t reason,
     memcpy(&pkt[5], &value1, 4);
     memcpy(&pkt[9], &value2, 4);
     memcpy(&pkt[13], &value3, 4);
-    bt_gatt_notify(get_primary_conn(), &audio_svc.attrs[2], pkt, sizeof(pkt));
+    notify_one(get_primary_conn(), pkt, sizeof(pkt));
 }
 
 #if GESTURE_DEBUG_HISTORY
@@ -3821,7 +3975,7 @@ static void flush_gesture_history(void)
     pkt[2] = EVT_GESTURE_HISTORY_BEGIN;
     pkt[3] = count;
     pkt[4] = session;
-    bt_gatt_notify(conn, &audio_svc.attrs[2], pkt, 5);
+    notify_one(conn, pkt, 5);
     k_msleep(GESTURE_HISTORY_FLUSH_GAP_MS);
 
     for (i = 0; i < count; i++) {
@@ -3836,7 +3990,12 @@ static void flush_gesture_history(void)
         memcpy(&pkt[7], &e->v1, 4);
         memcpy(&pkt[11], &e->v2, 4);
         memcpy(&pkt[15], &e->v3, 4);
-        bt_gatt_notify(conn, &audio_svc.attrs[2], pkt, 19);
+        if (notify_one(conn, pkt, 19) == -EAGAIN) {
+            /* Peer is backed up. Truncate rather than spend
+             * CTRL_NOTIFY_WAIT_MS per remaining entry in the main loop. */
+            printk(">>> Gesture history truncated at %u/%u\n", i, count);
+            break;
+        }
         k_msleep(GESTURE_HISTORY_FLUSH_GAP_MS);
     }
 
@@ -3845,7 +4004,7 @@ static void flush_gesture_history(void)
     pkt[2] = EVT_GESTURE_HISTORY_END;
     pkt[3] = count;
     pkt[4] = session;
-    bt_gatt_notify(conn, &audio_svc.attrs[2], pkt, 5);
+    notify_one(conn, pkt, 5);
 
     gesture_history_count = 0;
     gesture_history_flush_pending = false;
@@ -3910,7 +4069,7 @@ static bool flush_trajectory_batch(const gesture_trajectory_sample_t *samples,
         memcpy(&pkt[9], &period_ms, 2);
     }
     memcpy(&pkt[11], &gyro_bias_y_dps, 4);
-    if (bt_gatt_notify(conn, &audio_svc.attrs[2], pkt, 15) < 0) {
+    if (notify_one(conn, pkt, 15) < 0) {
         notify_error = true;
     }
     k_msleep(GESTURE_HISTORY_FLUSH_GAP_MS);
@@ -3939,10 +4098,18 @@ static bool flush_trajectory_batch(const gesture_trajectory_sample_t *samples,
             memcpy(&pkt[offset + 23], &sample->gz, 4);
             offset += 27;
         }
-        if (bt_gatt_notify(conn, &audio_svc.attrs[2], pkt, offset) < 0) {
-            notify_error = true;
-        } else {
-            sent += count;
+        {
+            int nerr = notify_one(conn, pkt, offset);
+
+            if (nerr < 0) {
+                notify_error = true;
+                if (nerr == -EAGAIN) {
+                    /* Peer backed up: truncate. END reports it via BIT(1). */
+                    break;
+                }
+            } else {
+                sent += count;
+            }
         }
         start += count;
         k_msleep(GESTURE_HISTORY_FLUSH_GAP_MS);
@@ -3955,7 +4122,7 @@ static bool flush_trajectory_batch(const gesture_trajectory_sample_t *samples,
     memcpy(&pkt[4], &sent, 2);
     pkt[6] = (overflow ? BIT(0) : 0) |
              (notify_error ? BIT(1) : 0);
-    (void)bt_gatt_notify(conn, &audio_svc.attrs[2], pkt, 7);
+    (void)notify_one(conn, pkt, 7);
     atomic_set(&trajectory_flush_busy, 0);
     printk(">>> %s flushed session=%u count=%u sent=%u flags=0x%02x\n",
            label, session, sample_count, sent, pkt[6]);
@@ -4020,7 +4187,7 @@ static void send_event_packet_settle(float x, float y, float z, uint32_t elapsed
     memcpy(&pkt[19], &avg_speed,  4);
     memcpy(&pkt[23], &peak_speed, 4);
     memcpy(&pkt[27], &distance,   4);
-    bt_gatt_notify(get_primary_conn(), &audio_svc.attrs[2], pkt, sizeof(pkt));
+    notify_one(get_primary_conn(), pkt, sizeof(pkt));
 }
 
 /* ============================================================================
@@ -4448,6 +4615,7 @@ static void audio_thread(void *p1, void *p2, void *p3)
             flush_gesture_history();
             battery_update();
             last_activity_ms = k_uptime_get();   /* reset idle timer after recording */
+            last_recording_stop_ms = last_activity_ms;
             sync_primary_conn_speed();
             continue;
         }
@@ -4504,19 +4672,90 @@ static struct bt_gatt_exchange_params exchange_params[MAX_CONNS];
  * Deferred advertising restart
  * ============================================================================ */
 
+/* Fast tier == the plain BT_LE_ADV_CONN interval (100-150 ms): what an
+ * undiscovered node should do.  Slow tier keeps the second slot reachable for
+ * the Mac client without burning 100-150 ms of radio forever while one peer is
+ * already connected. */
+static const struct bt_le_adv_param adv_param_fast = BT_LE_ADV_PARAM_INIT(
+        BT_LE_ADV_OPT_CONNECTABLE,
+        BT_GAP_ADV_FAST_INT_MIN_2,   /* 100 ms */
+        BT_GAP_ADV_FAST_INT_MAX_2,   /* 150 ms */
+        NULL);
+static const struct bt_le_adv_param adv_param_slow = BT_LE_ADV_PARAM_INIT(
+        BT_LE_ADV_OPT_CONNECTABLE,
+        BT_GAP_ADV_SLOW_INT_MIN,     /* 1 s   */
+        BT_GAP_ADV_SLOW_INT_MAX,     /* 1.2 s */
+        NULL);
+
+typedef enum {
+    ADV_TIER_UNKNOWN = 0,
+    ADV_TIER_OFF,
+    ADV_TIER_SLOW,
+    ADV_TIER_FAST,
+} adv_tier_t;
+
+static adv_tier_t adv_tier;
+static int64_t adv_conn_change_ms;   /* last time active_count() changed */
+
+static void adv_note_conn_change(void)
+{
+    adv_conn_change_ms = k_uptime_get();
+}
+
 static void adv_work_handler(struct k_work *work)
 {
-    if (active_count() >= MAX_CONNS) {
+    ARG_UNUSED(work);
+
+    int n = active_count();
+    adv_tier_t want;
+    const struct bt_le_adv_param *param;
+    const char *label;
+    int ret;
+
+    if (n >= MAX_CONNS) {
+        want = ADV_TIER_OFF;
+    } else if (n > 0 &&
+               (k_uptime_get() - adv_conn_change_ms) >= ADV_FAST_BURST_MS) {
+        want = ADV_TIER_SLOW;
+    } else {
+        want = ADV_TIER_FAST;
+    }
+
+    if (want == adv_tier) {
         return;
     }
-    int ret = bt_le_adv_start(BT_LE_ADV_CONN, adv_data, ARRAY_SIZE(adv_data),
-                              scan_rsp, ARRAY_SIZE(scan_rsp));
-    if (ret && ret != -EALREADY) {
-        LOG_WRN("Advertising restart failed: %d", ret);
-        printk(">>> Adv restart failed: %d\n", ret);
-    } else {
-        printk(">>> Advertising restarted\n");
+
+    /* BT_LE_ADV_CONN has no BT_LE_ADV_OPT_ONE_TIME, so BT_ADV_PERSIST is set and
+     * the host already resumed advertising from inside the LE Connection
+     * Complete handler.  bt_le_adv_start() would then return -EALREADY WITHOUT
+     * reprogramming the interval, so the tier must be stopped first. */
+    (void)bt_le_adv_stop();
+
+    if (want == ADV_TIER_OFF) {
+        adv_tier = want;
+        printk(">>> Adv off (conns=%d)\n", n);
+        return;
     }
+
+    if (want == ADV_TIER_SLOW) {
+        param = &adv_param_slow;
+        label = "slow(1000-1200ms)";
+    } else {
+        param = &adv_param_fast;
+        label = "fast(100-150ms)";
+    }
+
+    ret = bt_le_adv_start(param, adv_data, ARRAY_SIZE(adv_data),
+                          scan_rsp, ARRAY_SIZE(scan_rsp));
+    if (ret) {
+        LOG_WRN("Advertising start failed: %d", ret);
+        printk(">>> Adv start failed: %d\n", ret);
+        adv_tier = ADV_TIER_UNKNOWN;
+        k_work_schedule(&adv_work, K_MSEC(500));
+        return;
+    }
+    adv_tier = want;
+    printk(">>> Adv tier=%s conns=%d\n", label, n);
 }
 
 /* ============================================================================
@@ -4555,6 +4794,25 @@ static void serial_cmd_thread(void *p1, void *p2, void *p3)
     }
 }
 
+/* Local table rather than CONFIG_BT_HCI_ERR_TO_STR (EXPERIMENTAL, and it pulls
+ * in the full error table).  These are the reasons that actually show up on a
+ * peripheral link. */
+static const char *hci_reason_str(uint8_t reason)
+{
+    switch (reason) {
+    case 0x08: return "CONN_TIMEOUT(supervision)";
+    case 0x13: return "REMOTE_USER_TERM";
+    case 0x15: return "REMOTE_POWER_OFF";
+    case 0x16: return "LOCAL_HOST_TERM";
+    case 0x22: return "LL_RESPONSE_TIMEOUT";
+    case 0x28: return "INSTANT_PASSED";
+    case 0x2A: return "DIFF_TRANSACTION_COLLISION";
+    case 0x3B: return "UNACCEPTABLE_CONN_PARAM";
+    case 0x3E: return "CONN_FAIL_TO_ESTABLISH";
+    default:   return "?";
+    }
+}
+
 static void ble_connected(struct bt_conn *conn, uint8_t err)
 {
     if (err) { LOG_ERR("BLE connection failed: %d", err); return; }
@@ -4570,6 +4828,10 @@ static void ble_connected(struct bt_conn *conn, uint8_t err)
     }
 
     connections[slot] = bt_conn_ref(conn);
+    conn_started_ms[slot] = k_uptime_get();
+    conn_param_seen[slot] = false;
+    had_conn_this_cycle = true;
+    adv_note_conn_change();
 
     if (primary_idx < 0) {
         primary_idx = slot;
@@ -4577,7 +4839,7 @@ static void ble_connected(struct bt_conn *conn, uint8_t err)
     } else {
         printk(">>> conn[%d] is secondary, notifying primary\n", slot);
         uint8_t pkt[3] = { 0x00, 0x55, 0x31 };
-        bt_gatt_notify(get_primary_conn(), &audio_svc.attrs[2], pkt, sizeof(pkt));
+        notify_one(get_primary_conn(), pkt, sizeof(pkt));
     }
 
     /* Notifying here would reach nobody: the client subscribes about a second
@@ -4607,17 +4869,39 @@ static void ble_connected(struct bt_conn *conn, uint8_t err)
 
 static void ble_disconnected(struct bt_conn *conn, uint8_t reason)
 {
-    LOG_INF("BLE disconnected: %d", reason);
-    printk(">>> Disconnected: %d\n", reason);
-
+    int64_t now = k_uptime_get();
     int idx = conn_index(conn);
+
+    LOG_INF("BLE disconnected: %d", reason);
+
     if (idx < 0) {
+        printk(">>> DISCONN (unknown slot) reason=0x%02x %s\n",
+               reason, hci_reason_str(reason));
         return;
     }
+
+    /* Everything needed to tell "the peer/link went away" from "we reset"
+     * apart, without a sniffer:
+     *   reason  - who dropped it and why
+     *   age     - how long the link lived
+     *   params  - what the link was actually running at, or never-updated,
+     *             which would mean the peer ignored every parameter request
+     *   ndrop   - control notifies dropped because the peer stopped ACKing */
+    printk(">>> DISCONN idx=%d reason=0x%02x %s up=%llds age=%llds "
+           "params=%u/%u/%u(%s) since_rec=%llds ndrop=%u\n",
+           idx, reason, hci_reason_str(reason),
+           now / 1000, (now - conn_started_ms[idx]) / 1000,
+           conn_param_interval[idx], conn_param_latency[idx],
+           conn_param_timeout[idx],
+           conn_param_seen[idx] ? "negotiated" : "never-updated",
+           last_recording_stop_ms ? (now - last_recording_stop_ms) / 1000 : -1,
+           ctrl_notify_dropped);
 
     bt_conn_unref(connections[idx]);
     connections[idx] = NULL;
     conn_needs_greeting[idx] = false;
+    conn_param_seen[idx] = false;
+    adv_note_conn_change();
 
     if (primary_idx == idx) {
         primary_idx = -1;
@@ -4633,11 +4917,14 @@ static void ble_disconnected(struct bt_conn *conn, uint8_t reason)
             stop_requested = true;
             reset_recording_stop_state();
             gyro_set_enabled(false);
+            /* Latch is global, not per-conn: clear it so the next connection
+             * re-requests its parameters instead of assuming the old state. */
+            ble_primary_want_fast = false;
         }
     } else if (primary_idx >= 0) {
         printk(">>> Secondary disconnected, notifying primary\n");
         uint8_t pkt[3] = { 0x00, 0x55, 0x32 };
-        bt_gatt_notify(get_primary_conn(), &audio_svc.attrs[2], pkt, sizeof(pkt));
+        notify_one(get_primary_conn(), pkt, sizeof(pkt));
     }
 
     led_sync_runtime_state();
@@ -4652,6 +4939,13 @@ static void ble_le_param_updated(struct bt_conn *conn, uint16_t interval,
 {
     int idx = conn_index(conn);
 
+    if (idx >= 0) {
+        conn_param_interval[idx] = interval;
+        conn_param_latency[idx]  = latency;
+        conn_param_timeout[idx]  = timeout;
+        conn_param_seen[idx]     = true;
+    }
+
     printk(">>> le_param_updated[%d]: interval=%u (%u.%02u ms) latency=%u timeout=%u (%u ms)\n",
            idx, interval, (interval * 125U) / 100U, (interval * 125U) % 100U,
            latency, timeout, timeout * 10U);
@@ -4663,15 +4957,29 @@ static struct bt_conn_cb conn_callbacks = {
     .le_param_updated = ble_le_param_updated,
 };
 
+/* How long to stay unconnected before SYSTEMOFF.
+ * A peer that was connected and vanished is usually coming back (Doze, out of
+ * range, app restart), so give it room; a node nobody ever connected to, or one
+ * whose battery is nearly flat, sleeps on the short fuse. */
+static uint32_t systemoff_fuse_ms(void)
+{
+    if (bat_last_pct < ADV_LOW_BATT_PCT) {
+        return ADV_NO_CONN_SLEEP_MS;
+    }
+    return had_conn_this_cycle ? ADV_AFTER_DROP_SLEEP_MS : ADV_NO_CONN_SLEEP_MS;
+}
+
 static void enter_systemoff_for_tap_wake(void)
 {
     uint8_t tap_src = 0;
     int ret;
 
-    printk(">>> SYSTEMOFF: 3 min unconnected, double-tap to wake\n");
-    LOG_INF("Entering SYSTEMOFF; double-tap to resume advertising");
+    printk(">>> SYSTEMOFF: %u min unconnected (had_conn=%d), tap to wake\n",
+           (unsigned)(systemoff_fuse_ms() / 60000U), (int)had_conn_this_cycle);
+    LOG_INF("Entering SYSTEMOFF; tap to resume advertising");
 
     rgb_set(false, false, false);
+    adv_tier = ADV_TIER_UNKNOWN;
 
     if (wdt_channel_id >= 0) {
         wdt_feed(wdt, wdt_channel_id);
@@ -4681,6 +4989,7 @@ static void enter_systemoff_for_tap_wake(void)
 
     if (!device_is_ready(imu) || !i2c_is_ready_dt(&imu_i2c)) {
         printk(">>> SYSTEMOFF aborted: IMU not ready\n");
+        adv_tier = ADV_TIER_UNKNOWN;
         k_work_schedule(&adv_work, K_MSEC(100));
         unconnected_since_ms = k_uptime_get();
         return;
@@ -4690,6 +4999,7 @@ static void enter_systemoff_for_tap_wake(void)
 
     ret = i2c_reg_update_byte_dt(&imu_i2c, LSM6DS3TR_C_REG_MD1_CFG,
                                  LSM6DS3TR_C_MD1_TAP_MASK,
+                                 LSM6DS3TR_C_MD1_SINGLE_TAP |
                                  LSM6DS3TR_C_MD1_DOUBLE_TAP);
     if (ret < 0) {
         printk(">>> SYSTEMOFF aborted: MD1_CFG %d\n", ret);
@@ -4730,6 +5040,7 @@ restore_adv:
                                  LSM6DS3TR_C_MD1_SINGLE_TAP |
                                  LSM6DS3TR_C_MD1_DOUBLE_TAP);
     (void)sensor_trigger_set(imu, &tap_trigger, tap_irq_handler);
+    adv_tier = ADV_TIER_UNKNOWN;
     k_work_schedule(&adv_work, K_MSEC(100));
     unconnected_since_ms = k_uptime_get();
 }
@@ -4752,6 +5063,14 @@ int main(void)
     printk("============================================\n\n");
 
     log_reset_cause();
+
+    /* Arm the watchdog FIRST, before anything that can hang.
+     * It used to be armed after boot_write_img_confirmed(), which meant a bad
+     * OTA image that hung during init had no dog and sat there forever -- the
+     * only way back was a physical reset. Armed here, such a hang resets within
+     * WDT_TIMEOUT_MS and MCUboot reverts the unconfirmed image by itself.
+     * Every wait in the boot path below must therefore feed it. */
+    configure_watchdog();
 
     LOG_INF("Starting nordic-main");
 
@@ -4788,9 +5107,11 @@ int main(void)
     ret = bt_set_name(BLE_DEVICE_NAME);
     if (ret) { LOG_ERR("BLE name set failed: %d", ret); return ret; }
 
-    ret = bt_le_adv_start(BT_LE_ADV_CONN, adv_data, ARRAY_SIZE(adv_data),
+    ret = bt_le_adv_start(&adv_param_fast, adv_data, ARRAY_SIZE(adv_data),
                           scan_rsp, ARRAY_SIZE(scan_rsp));
     if (ret) { LOG_ERR("BLE adv failed: %d", ret); return ret; }
+    adv_tier = ADV_TIER_FAST;
+    adv_note_conn_change();
 
     LOG_INF("BLE advertising: %s", BLE_DEVICE_NAME);
 
@@ -4809,7 +5130,16 @@ int main(void)
     LOG_INF("nordic-main ready");
 
     /* Boot LED: white for ~1 second, then advertising blink or idle */
-    k_msleep(1000);
+    {
+        int64_t boot_led_until = k_uptime_get() + 1000;
+
+        while (k_uptime_get() < boot_led_until) {
+            if (wdt_channel_id >= 0) {
+                wdt_feed(wdt, wdt_channel_id);
+            }
+            k_msleep(MAIN_LOOP_INTERVAL_MS);
+        }
+    }
     led_set_state(LED_IDLE);
     led_sync_runtime_state();
 
@@ -4818,6 +5148,9 @@ int main(void)
         int64_t confirm_until = k_uptime_get() + 2000;
 
         while (k_uptime_get() < confirm_until) {
+            if (wdt_channel_id >= 0) {
+                wdt_feed(wdt, wdt_channel_id);
+            }
             led_tick();
             k_msleep(MAIN_LOOP_INTERVAL_MS);
         }
@@ -4833,15 +5166,15 @@ int main(void)
         }
     }
 
-    /* Arm watchdog after image confirmation */
-    configure_watchdog();
-
     /* Initial battery reading after BLE is ready */
     battery_update();
 
     /* Main loop: watchdog feed + LED state management + blink tick + IMU motion */
     int64_t last_motion_sample_ms = k_uptime_get();
     int64_t last_battery_ms = k_uptime_get();
+    int64_t last_heartbeat_ms = 0;
+    int64_t last_pass_ms = 0;
+    uint32_t hb_seq = 0;
     last_activity_ms = k_uptime_get();
     while (1) {
         k_msleep(MAIN_LOOP_INTERVAL_MS);
@@ -4854,6 +5187,22 @@ int main(void)
 
         int64_t now_ms = k_uptime_get();
 
+        /* A pass should take ~MAIN_LOOP_INTERVAL_MS. Anything much longer means
+         * something in the body blocked, which is the failure this loop must
+         * never hit: it is the only thing feeding the watchdog. */
+        if (last_pass_ms &&
+            (now_ms - last_pass_ms) > MAIN_LOOP_STALL_WARN_MS) {
+            printk(">>> STALL %lld ms at stage=%u(%s) conns=%d ndrop=%u\n",
+                   now_ms - last_pass_ms, cb.stage, stage_str(cb.stage),
+                   active_count(), ctrl_notify_dropped);
+        }
+        last_pass_ms = now_ms;
+        cb.up_s = (uint32_t)(now_ms / 1000);
+        cb.conns = (uint8_t)active_count();
+        cb.recording = is_recording ? 1 : 0;
+        cb.ndrop = ctrl_notify_dropped;
+        loop_stage(STAGE_IDLE);
+
         apply_pending_operation_mode();
 
         /* IMU motion detection — poll faster when active, slower when sleeping */
@@ -4863,16 +5212,21 @@ int main(void)
         if (device_is_ready(imu) &&
             (now_ms - last_motion_sample_ms) >= imu_poll_ms) {
             last_motion_sample_ms = now_ms;
+            loop_stage(STAGE_MOTION);
             process_motion_sample();
         }
+        loop_stage(STAGE_TAP);
         process_tap_event(now_ms);
 
+        loop_stage(STAGE_GREET);
         send_pending_greetings();
 
         if (tap_diag_once_pending) {
             tap_diag_once_pending = false;
+            loop_stage(STAGE_TAPDIAG);
             send_tap_diag();
         }
+        loop_stage(STAGE_IDLE);
 
         led_tick();
 
@@ -4882,13 +5236,17 @@ int main(void)
             if (!light_sleep_active &&
                 (now_ms - last_activity_ms) >= SLEEP_IDLE_TIMEOUT_MS) {
                 light_sleep_active = true;
+                loop_stage(STAGE_SLEEPNFY);
                 send_event_packet(0x20);
+                loop_stage(STAGE_IDLE);
                 printk(">>> Light sleep enter\n");
             }
         } else {
             if (light_sleep_active) {
                 light_sleep_active = false;
+                loop_stage(STAGE_SLEEPNFY);
                 send_event_packet(0x21);
+                loop_stage(STAGE_IDLE);
                 printk(">>> Light sleep wake\n");
             }
             last_activity_ms = now_ms;
@@ -4897,15 +5255,45 @@ int main(void)
         if (active_count() > 0) {
             unconnected_since_ms = 0;
             sync_primary_conn_speed();
+            /* Drop out of the post-connect fast advertising burst. */
+            if (adv_tier == ADV_TIER_FAST &&
+                (now_ms - adv_conn_change_ms) >= ADV_FAST_BURST_MS) {
+                k_work_schedule(&adv_work, K_NO_WAIT);
+            }
         } else {
             if (unconnected_since_ms == 0) {
                 unconnected_since_ms = now_ms;
             }
             if (nrf_power_usbregstatus_vbusdet_get(NRF_POWER)) {
                 unconnected_since_ms = now_ms;
-            } else if ((now_ms - unconnected_since_ms) >= ADV_NO_CONN_SLEEP_MS) {
+            } else if ((now_ms - unconnected_since_ms) >= systemoff_fuse_ms() &&
+                       !is_recording && !recording_requested) {
                 enter_systemoff_for_tap_wake();
             }
+        }
+
+        /* Heartbeat: one line every 30 s while connected. hb_seq restarts at 1
+         * after a reboot, so a '#1' following a '#N' is a reset, not a link
+         * drop -- the two are indistinguishable from the peer's side. */
+        if (active_count() > 0 &&
+            (now_ms - last_heartbeat_ms) >= HEARTBEAT_INTERVAL_MS) {
+            last_heartbeat_ms = now_ms;
+            cb.hb_seq = ++hb_seq;
+            printk(">>> HB #%u up=%llds conns=%d rec=%d slp=%d bat=%u%% "
+                   "ndrop=%u adv=%d",
+                   hb_seq, now_ms / 1000, active_count(), (int)is_recording,
+                   (int)light_sleep_active, bat_last_pct, ctrl_notify_dropped,
+                   (int)adv_tier);
+            for (int i = 0; i < MAX_CONNS; i++) {
+                struct bt_conn_info info;
+
+                if (connections[i] &&
+                    bt_conn_get_info(connections[i], &info) == 0) {
+                    printk(" c%d=%u/%u/%u", i, info.le.interval,
+                           info.le.latency, info.le.timeout);
+                }
+            }
+            printk("\n");
         }
 
         /* Battery polling — force immediate re-read on USB disconnect */
@@ -4919,7 +5307,9 @@ int main(void)
         }
         if ((now_ms - last_battery_ms) >= BATTERY_POLL_INTERVAL_MS) {
             last_battery_ms = now_ms;
+            loop_stage(STAGE_BATTERY);
             battery_update();
+            loop_stage(STAGE_IDLE);
         }
     }
 
