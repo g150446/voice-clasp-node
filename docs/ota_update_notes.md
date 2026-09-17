@@ -157,3 +157,30 @@
   reset cause と `.noinit` クラッシュボックスを接続ごとに greeting で送る。
   Android アプリは未知の TX イベントを hex で logcat に出すので**アプリ変更は不要**。
   読み方は `nordic_main_guide.md` の「起動レポート `0xD3`」。
+
+- 2026-09-17: 0.0.104（`sysbuild/mcuboot/boards/xiao_ble_nrf52840_sense.conf` の
+  `CONFIG_BOOT_WATCHDOG_FEED` を `n` → `y`）。0.0.103 の起動レポートで
+  `reset cause: 0x00000012 SOFTWARE | WATCHDOG` が見えたことから発覚：
+  nRF52 の WDT はソフトリセットでは止まらず（POR でしか止まらない）、MCUboot は
+  スワップ中に犬へ給餌していなかった。256 KB のスワップは 30〜60 秒かかり
+  `WDT_TIMEOUT_MS`（12 s）を必ず超えるため、**OTA のたびにスワップ中盤でリセットしていた**
+  （スワップはレジューム可能なので更新自体は毎回成功していたが、無駄なリセットと
+  スワップ再開が1回挟まっていた）。
+  **MCUboot はアプリの OTA では配信できない**（MCUmgr が書くのはアプリのセカンダリスロットのみ、
+  MCUboot は `0x27000` に常駐）。UF2 ブートローダ（ダブルタップリセットで起動、
+  `XIAO-SENSE` としてマウント）から `merged.hex` の `0x27000`–`0x720d4` ＋ 両スロットの
+  トレーラ消去（`0xD7000` まで 0xFF）を書き込んで適用した。
+  Adafruit ブートローダ（`0xF4000`）と設定領域（`0xD7000`）は無変更。
+- 2026-09-17: 0.0.105（バージョンのみ、0.0.104 の MCUboot 修正を実 OTA スワップで検証するため）。
+  0.0.104 → 0.0.105 の OTA を実行し、アップロード完了後 `EVT_BOOT_REPORT`（`0xD3`）を確認：
+
+  ```
+  reset cause : 0x00000002  SOFTWARE
+  crash_valid : 1
+  stage       : 0 (idle)
+  prev uptime : 62 s
+  ```
+
+  **`WATCHDOG` ビットが消えた。** 0.0.103 での同種の OTA（`0x00000012 SOFTWARE | WATCHDOG`）
+  と比べ、スワップ中に犬が吠えなくなったことを実機で確認。OTA のスキャン再試行も
+  1 回のみ（以前は複数回）に減った。

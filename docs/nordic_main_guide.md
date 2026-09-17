@@ -18,7 +18,7 @@ opt-in したときだけ自律 start/stop する（FW `0.0.95+`）。
 | IMU | LSM6DS3TR-C（加速度 ODR 416 Hz。ジャイロはオンデマンド 104 Hz） |
 | 音声フォーマット | 16 kHz / 16-bit / モノラル PCM |
 | LED 方針 | 未接続アドバタイズ中は青の遅い点滅。接続待機は消灯。録音中のみ赤 |
-| 署名バージョン（目安） | `0.0.102+`（primary idle 30–50 ms、supervision 8 s、WDT 12 s。未接続 3 分／接続実績ありは 30 分で SYSTEMOFF） |
+| 署名バージョン（目安） | `0.0.105+`（primary idle 30–50 ms、supervision 8 s、WDT 12 s。未接続 3 分／接続実績ありは 30 分で SYSTEMOFF。MCUboot はスワップ中も給餌） |
 | OTA 手順 | [`ota_update_notes.md`](ota_update_notes.md) |
 | 録音操作 | 既定: シングルタップ（ホスト RX）。ジェスチャーは RX `0x07=1` かつ通常モード時のみ |
 
@@ -724,6 +724,28 @@ Device reset. MCUboot will swap slots on next boot.
 Waiting for the updated device to return...
 OTA verified: uploaded image is active and confirmed in slot 0 (version=...).
 ```
+
+#### スワップ中の MCUboot ウォッチドッグ（`0.0.104+`）
+
+nRF52 の WDT はソフトリセットでは止まらず（POR でしか止まらない）。MCUboot は
+既定でスワップ中に給餌しないため、256 KB のスワップ（30〜60 秒）が
+`WDT_TIMEOUT_MS`（12 s）を超えて**毎回スワップ途中でリセットしていた**。
+スワップ自体はレジューム可能なので OTA は最終的に成功するが、無駄なリセットと
+再開が 1 回挟まる（`Scanning for 'HarnessNode'...` が複数回出るのはこれが理由）。
+
+`sysbuild/mcuboot/boards/xiao_ble_nrf52840_sense.conf` の
+`CONFIG_BOOT_WATCHDOG_FEED=y` で解消。**この設定はアプリの OTA では配れない**
+（MCUmgr が書くのはアプリのセカンダリスロットのみで、MCUboot は `0x27000` に
+常駐する別イメージ）。変更する場合は UF2 ブートローダから書き直す必要がある：
+
+1. リセットボタンを素早く 2 回押して UF2 ブートローダに入る（`XIAO-SENSE` がマウントされる）
+2. `west build` の `build/merged.hex` から `0x27000`–（アプリ末尾）を抽出し、
+   両スロットのトレーラ領域（〜`0xD7000`）を `0xFF` で埋めた UF2 を作って書き込む
+   （トレーラ消去で MCUboot のスワップ状態を一掃する）
+3. `pm_static.yml` の `adafruit_boot`（`0xF4000`）と `settings_storage`（`0xD7000`）は触らない
+
+修正の確認は `EVT_BOOT_REPORT`（`0xD3`）の `reset cause` から `WATCHDOG` ビットが
+消えたことで行う（下記参照）。
 
 ---
 
