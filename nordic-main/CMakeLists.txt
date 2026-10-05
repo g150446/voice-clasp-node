@@ -9,6 +9,7 @@ project(nordic_main)
 
 target_sources(app PRIVATE
     src/main.c
+    src/tap_detector.c
     src/audio_capture.c
     src/adpcm.c
 )

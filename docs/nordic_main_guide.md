@@ -15,7 +15,7 @@ opt-in したときだけ自律 start/stop する（FW `0.0.95+`）。
 | ブートローダ | MCUboot（Adafruit UF2 ブートローダ経由で 0x27000 に配置） |
 | OTA | MCUboot + BLE SMP（MCUmgr） |
 | PDM マイク | DMIC（Zephyr DMIC API、RIGHT チャンネル、マイク電源制御あり） |
-| IMU | LSM6DS3TR-C（加速度 ODR 416 Hz。ジャイロはオンデマンド 104 Hz） |
+| IMU | LSM6DS3TR-C（加速度416 Hz／±4 g、FIFOでソフトウェアタップ判定。ジャイロはオンデマンド104 Hz） |
 | 音声フォーマット | 16 kHz / 16-bit / モノラル PCM |
 | LED 方針 | 未接続アドバタイズ中は青の遅い点滅。接続待機は消灯。録音中のみ赤 |
 | 署名バージョン（目安） | `0.0.105+`（primary idle 30–50 ms、supervision 8 s、WDT 12 s。未接続 3 分／接続実績ありは 30 分で SYSTEMOFF。MCUboot はスワップ中も給餌） |
@@ -155,10 +155,9 @@ RX には付けない（`mac_client/tap_monitor.py` の `bytes([0x50, reg, val])
 **録音中は拒否**し、`0xD4` の `accepted` に 0 を載せて返す。詳細は下の
 「UF2 ブートローダへ再起動する」。
 
-`0x50` / `0x51` はタップ調整用の診断コマンド。書き込みは `CTRL1_XL` `CTRL6_C`
-`CTRL10_C` `TAP_CFG` `TAP_THS_6D` `INT_DUR2` `WAKE_UP_THS` `MD1_CFG` に限定され、
-それ以外は `-EPERM` で拒否する。OTAなしで閾値・軸・Duration を実機で振れるので、
-タップ系の調査はまずこれを使う（`mac_client/tap_monitor.py --write 0x59:0x04` など）。
+`0x50` / `0x51` はタップ調整用の診断コマンド。`0.0.107+`の書き込みは `TAP_CFG` `TAP_THS_6D` `INT_DUR2` `WAKE_UP_THS` に限定され、
+それ以外は `-EPERM` で拒否する。これらは旧内蔵タップ用の設定であり、ソフトウェア判定の閾値・時間窓は変わらない
+（診断例: `mac_client/tap_monitor.py --write 0x59:0x04` など）。
 
 ### TX パケット形式（ファームウェア → ホスト）
 
@@ -192,8 +191,8 @@ RX には付けない（`mac_client/tap_monitor.py` の `bytes([0x50, reg, val])
 | `0x20` | `sleep_enter` | なし | ライトスリープ移行（10 秒無動作） |
 | `0x21` | `sleep_wake` | なし | ライトスリープ復帰（モーション検出） |
 | `0x30` | `gesture_diag` | stage/reason u8 + value1/2/3 f32 LE | USBなしのジェスチャー内部診断（検出 ON 時のみ） |
-| `0xD0` | `tap_diag` | read_ret i8 + CTRL1_XL/CTRL6_C/TAP_CFG/TAP_THS_6D/INT_DUR2/WAKE_UP_THS/MD1_CFG/INT1_CTRL u8 + nonzero_count u16 LE + int1_level i8 | タップ関連レジスタのスナップショット（接続確立時に1回。任意タイミングの個別読み出しは RX `0x51` → `0xD2`） |
-| `0xD1` | `tap_src_raw` | TAP_SRC u8 + read_ret i8 | 判定に使った生の `TAP_SRC`。タップ1回につき1パケット |
+| `0xD0` | `tap_diag` | FIFO read_ret i8 + CTRL1_XL/CTRL6_C/TAP_CFG/TAP_THS_6D/INT_DUR2/WAKE_UP_THS/MD1_CFG/INT1_CTRL u8 + nonzero_count u16 LE + int1_level i8 | タップ関連レジスタのスナップショット（接続確立時に1回。任意タイミングの個別読み出しは RX `0x51` → `0xD2`） |
+| `0xD1` | `tap_src_raw`（旧） | TAP_SRC u8 + read_ret i8 | `0.0.107+`では送信しない（ソフトウェア判定へ移行） |
 | `0xD2` | `imu_reg_ack` | reg u8 + 読み戻し値 u8 + ret i8 | RX `0x50` / `0x51` への応答 |
 | `0xD3` | `boot_report` | cause u32 LE + crash_valid u8 + stage u8 + prev_up_s u16 LE + hb u16 LE + ndrop u16 LE | 接続ごとに greeting の先頭で1回。`0.0.103+`。読み方は「起動レポート `0xD3`」 |
 | `0xD4` | `reboot_ack` | mode u8（1=UF2 ブートローダ） + accepted u8 | RX `0x60` への応答。`accepted=0` は録音中による拒否。`0.0.106+` |
@@ -398,145 +397,82 @@ reason の読み方：`0x08 CONN_TIMEOUT` は本物の supervision timeout、
 メンバに `=n` を書いても無視され**、実際は deferred のままだった。
 別スレッドが 1 秒周期で吐く方式では、ハング直前の 1 行がリングに残ったまま失われる。
 
-### シングル／ダブルタップ
+### シングル／ダブルタップ（FW `0.0.107+`）
 
-LSM6DS3TR-C のハードウェア判定を使用し、部品面を皮膚側にした装着状態で
-リストバンド表側から基板面へ垂直に行うタップを Z 軸で検出する。
+通常動作中のsingle/double判定は、IMU内蔵タップ機能ではなくLSM6DS3TR-Cの加速度FIFOを使うCソフトウェア検出器で行う。通知はsingle=`0x14`、double=`0x12`。どちらも通知のみで、録音操作はホストがRX `0x01` / `0x00`で指示する。
 
-| パラメータ | 既定（FW `0.0.97+`） | 備考 |
-|------------|---------------------|------|
-| 閾値 `TAP_THS_6D` | `0x11`（≈ **1.0625 g**） | FS=±2 g 時 `THS` は 0–31 の 32 段階（1 LSB ≈ 0.0625 g）。小さいほど敏感 |
-| 2 打最大間隔 Duration | ≈ 308 ms（`INT_DUR2=0x4a`） | |
-| 分類待ち | 350 ms（`TAP_SRC_SETTLE_MS`） | Duration 閉じ後に `TAP_SRC` を1回読む |
-| クールダウン | 700 ms | single / double 別 |
+| 項目 | 動作・既定値 |
+|---|---|
+| サンプル | 416 Hz、±4 g。XYZ加速度FIFO。ジャイロは不要 |
+| FIFO | continuous。16-bitデータポートから軸ごとに2 byte読む。読み損ない、overrun、軸パターン不一致、64超の滞留時はFIFOと分類器をリセット |
+| 整定 | 起動・FIFOリセット後500 ms |
+| 重力除去 | 各軸LPF、α=0.015 |
+| 衝撃開始 | Z方向がmax(1.0 g, 推定背景振動×4)以上、前15 ms静止、Zの変化0.30 g以上、同時刻の横方向より1.2倍以上 |
+| 衝撃終了 | 全軸0.35 g未満が20 ms続く。最大幅はFW既定40 ms |
+| double | 衝撃の開始間隔80–350 ms。singleは350 ms経過後に確定 |
+| 抑制 | single後700 ms、double後700 ms。double後のsingle通知は1500 ms抑制 |
+| SYSTEMOFF wake | CPU停止中だけ内蔵single/double割り込みを使用。復帰後はFIFOによるソフトウェア判定へ戻す |
 
-実行時調整は RX `0x50` で `TAP_THS_6D`（`0x59`）などへ書き込み可（再起動で既定に戻る）。
-OTA なしの試し書き例: `mac_client/tap_monitor.py --write 0x59:0x12`。
+FSMはサンプル数で時間を管理するため、メインループの起床間隔による揺れを避ける。データ欠落前後の衝撃を組み合わせない。運転モード指定・ジェスチャー検出は別機能である。
 
-| モード | single (`0x14`) | double (`0x12`) |
-|--------|-----------------|-----------------|
-| 通常 | **notify-only**（録音はホスト RX）。待機中の開始ジェスチャー候補は double 時に破棄 | 通知のみ（録音不変）。開始ジェスチャー候補を破棄し 3 s re-arm |
-| 運転 | 同上（ジェスチャー無効） | 通知のみ（録音不変） |
+#### 波形採取・一時設定
 
-録音 start/stop はホストが RX `0x01` / `0x00` で指示する（パススルー中の single はページ送り専用で RX を送らない）。
-手首ジェスチャーによる録音は、検出スイッチ ON かつ通常モードのときだけ Node 自律。
+`mac_client/tap_lab.py`は、明示的に開始した試行だけ最大8秒のXYZ生波形（±4 g、1 LSB=0.000122 g）と検出器状態をRAMへ保存する。採取後にBLEで読み出すので、サンプリング中は転送を行わない。フラッシュへの周期書き込みはない。設定はRAM内だけに適用し、再起動でFW既定値へ戻る。検出器とFIFOをリセットして記録を始め、設定、候補、棄却、確定通知、FIFO欠落、飽和フラグを保存する。
 
-Android は RX characteristic に:
+BLEコマンドの整数・floatはlittle endian。`config`は6×f32（`quiet_g`, `peak_g`, `edge_g`, `dominance`, `gravity_alpha`, `noise_multiplier`）と8×u16（前静止、立ち上がり、後静止、最大衝撃幅、最小/最大double間隔、抑制時間）の40 byte。
 
-- `[0x05, mode]`（`mode=0` 通常、`mode=1` 運転）→ ack `0x40`
-- `[0x07, e]`（ジェスチャー検出、既定 OFF）→ ack `0x3A`
-- `[0x06, e]`（IMU 軌跡収集、既定 OFF）→ ack `0x39`
+| RX | 動作 | TX |
+|---|---|---|
+| `[0x54,0]` | 設定読出し | `0xD7, status, config` |
+| `[0x54,1] + config` | 設定変更（採取中は不可） | `0xD7, status, readback` |
+| `[0x54,2]` | 既定値に戻す | `0xD7, status, defaults` |
+| `[0x53,0]` | 採取状態 | `0xD6, status, id, target, count, Hz, gaps, active, config` |
+| `[0x53,1] + u16 samples` | 416–3328サンプル採取（録音中は不可） | 同じ状態応答。設定のスナップショットを含む |
+| `[0x53,2] + u16 offset` | 完了した採取の最大16サンプルを読む | `0xD6, status, id, offset, count, records` |
 
-録音中の運転モード変更は pending として保持し、録音停止後に適用する。
-ライトスリープ中は復帰し、タップが掌上静止開始ジェスチャーとして
-扱われないよう、待機中の開始候補を破棄する（検出 ON かつ通常モード）。
+各recordはXYZのi16 rawとflags（u16）。flags bit0=pulse、1=幅による棄却、2=single保留、3=衝撃採用、4=single、5=double、6=直前のFIFO欠落、7=測定範囲上限付近。状態/設定応答のstatusは0=成功、1=busy、2=不正値、3=FIFO再初期化失敗。offsetでchunkを再取得できる。最大notificationは138 byteなのでATT MTU 141以上を要する。
 
-`0x40` の送信タイミング（`0.0.88+`）:
+macOSのBLE操作はTerminalで実行する。`check`は身体操作なしの1秒採取・転送と、PC再生との一致確認。`capture`はsingle / double / motionを1試行ずつ記録する。`--expect-config FILE`を付けると、設定値が一致しない場合はカウントダウンもGOも開始しない。
 
-- **要求を受理した時点**と**実際に適用した時点**の2回送る。受理時のackがないと、
-  録音中に保留された切替をホストが観測できない（`apply_pending_operation_mode()` は
-  録音中に早期returnするため、適用まで何も飛ばなかった）。
-- `notify_all_conns()` で**全接続へ**送る。Mac Handy が primary を握っている間も
-  Android がモードを追えるようにするため（`0.0.87` までは primary 1本にしか飛ばず、
-  secondary の Android には届かなかった）。
-- 接続確立時は primary / secondary のどちらでも現在のモードを1回送る。ただし送信は
-  `ble_connected()` ではなく **メインループが `bt_gatt_is_subscribed()` を見て**行う。
-  詳細は下の「接続時通知は購読完了を待つ」を参照。
-
-#### ハードウェア割り込み構成
-
-この機能は、25 / 50 ms ごとに取得する加速度値からCPUがタップ波形を分類する
-ソフトウェア検出ではない。LSM6DS3TR-C 内蔵のtap/double-tapエンジンと
-**INT1ハードウェア割り込み**を使用する。
-
-```
-リストバンド表側への衝撃
-  → LSM6DS3TR-C内蔵判定（Z軸、閾値・Shock・Quiet・Duration）
-  → 1打目の時点で IMU INT1 をassert（MD1_CFGにsingleも割り当てているため）
-  → XIAO P0.11のGPIO割り込み／メインループでのINT1レベル監視
-  → TAP_SRCには触れずに 350 ms 待つ（TAP_SRC_SETTLE_MS）
-  → HWのDurationが閉じた後に TAP_SRC を1回だけ読む
-  → TAP_IA|DOUBLE|Z なら double、それ以外は single
-  → BLE [0x00, 0x55, 0x12] または [0x00, 0x55, 0x14]
+```bash
+mac_client/venv/bin/python3 -u mac_client/tap_lab.py check
+mac_client/venv/bin/python3 -u mac_client/tap_lab.py capture --kind single --posture arm_raised_45deg --output /tmp/single.json
+mac_client/venv/bin/python3 -u mac_client/tap_lab.py capture --kind double --posture arm_raised_45deg --expect-config diagnostics/tap/2026-10-05/candidate_width_100ms.json --output /tmp/double.json
+mac_client/venv/bin/python3 -u mac_client/tap_lab.py capture --kind motion --posture arm_raised_45deg --output /tmp/motion.json
+python3 mac_client/tap_lab.py replay /tmp/single.json /tmp/double.json /tmp/motion.json
+python3 mac_client/tap_lab.py sweep /tmp/single.json /tmp/double.json /tmp/motion.json --output /tmp/candidates.json
+mac_client/venv/bin/python3 -u mac_client/tap_lab.py set --config /tmp/config.json
+mac_client/venv/bin/python3 -u mac_client/tap_lab.py set --defaults
 ```
 
-- 基板DTSの `irq-gpios = <&gpio0 11 GPIO_ACTIVE_HIGH>` により、IMU INT1は
-  nRF52840のP0.11へ接続される。
-- `INT1_CTRL` の加速度・ジャイロdata-ready割り込みを無効化し、`MD1_CFG` の
-  single-tap と double-tap を INT1 へ割り当てる。INT1に載るのはタップだけなので、
-  **INT1のassertは常に「打撃があった」ことを意味する**。
-- NCS v2.9.2のLSM6DSLドライバはこのセンサーの`SENSOR_TRIG_DOUBLE_TAP`を
-  実装していない。そのためtap関連レジスタをI2Cで直接設定し、ドライバの
-  `SENSOR_TRIG_DATA_READY`用INT1配送経路をGPIO通知手段として再利用する。
-  実際の割り込み源はdata-readyではなく、IMUが判定したタップである。
-- 同ドライバは初期化時に `CTRL6_C.XL_HM_MODE` を無条件でセットし、加速度計を
-  high-performance モードから外す。ST のタップ手順（AN5040）はこれがONである前提
-  なので、`configure_tap_detection()` で明示的にクリアする。
-- ドライバの `lsm6dsl_thread_cb()` は INT1 がラッチでhighのまま
-  `GPIO_INT_EDGE_TO_ACTIVE` を再武装し、`lsm6dsl_trigger_set` と違ってピンレベルを
-  再確認しない。立ち上がりエッジを取りこぼすことがあるため、ファームウェアは
-  **エッジではなくINT1のレベル**もメインループで見る。
-- 初期化に失敗した場合はタップ検出だけを無効化してログへ理由を出し、既存の
-  IMUポーリング、録音ジェスチャー、BLE接続は継続する。
+PC再生は本番の`tap_detector.c`を使用する。各sampleの状態flagが実機記録と一致すること、期待通知を分類することを確認する。FIFO欠落やセンサー飽和のある記録は設定探索に使わない。`sweep`はsingle、double、タップなしmotionの各波形を要求する。候補は保存波形への適合結果であり、独立した実機試行を通してから最終設定にする。
 
-#### TAP_SRC を1打目で読んではいけない（0.0.76〜0.0.86 回帰の真因）
+#### 実機結果（2026-10-05）
 
-`TAP_CFG` は LIR（latched interrupt request）を有効にしている。この状態で
-**Duration の窓が閉じる前に `TAP_SRC` を読むと、ラッチが解除されて進行中の
-ダブルタップ判定が中断される**。
+| 姿勢・設定 | single | double | タップなし動作 |
+|---|---|---|---|
+| 通常姿勢、40 ms | 1/1 検知 | 1/1 検知 | 1試行、誤検知なし |
+| 腕を45度に上げる、40 ms | 1/1 検知 | 0/1（single誤分類） | — |
+| 腕を45度に上げる、60 ms | — | 0/1（single誤分類） | — |
+| 腕を45度に上げる、100 ms | — | 1/1 検知 | 1試行、誤検知なし |
 
-`0.0.76` が `MD1_CFG` に `INT1_SINGLE_TAP`(BIT6) を追加したことで、INT1は
-1打目の時点でassertされるようになった。従来どおりINT1を見て即座に`TAP_SRC`を
-読むと、上記のとおり2打目の判定が壊れる。実測では、ダブルタップが
-`TAP_SRC=0x21`（`SINGLE|Z`、`TAP_IA`は立たない）2発に分解され、
-**`0x12` は一度も送信されなくなった**。`0.0.55`（double専用、`MD1_CFG=0x08`）が
-7/7 PASS していたのは、INT1がダブル確定後にしか上がらず、読み出しが必ず
-事後だったからである。
+すべての保存試行で2496サンプル、FIFO欠落0、飽和0。PC再生は実機flagsと全sample一致。45度の誤分類波形では1打目が40 msで約50 msに広がり、60 msでは約89 msに広がっていた。60 ms設定の独立試行も失敗。最大幅だけを100 msにすると、保存済み全8試行をPC上で期待どおり分類し、24合成ケースと設定検証ケースを通過。100 msの45度double実機は1試行成功した。少し速めの手首動作5秒も誤検知0だった。
 
-対策は「INT1が上がってから `TAP_SRC_SETTLE_MS`（350 ms＝HW Duration 308 ms＋
-メインループ25 ms＋余裕）待ってから1回だけ読む」。窓が閉じた後なので、
-レジスタは最終判定を持っている。
+**実機RAMには100 msを一時適用中。** OTA版0.0.111の既定値は40 msで、再起動またはSYSTEMOFF復帰後は40 msへ戻る。候補設定での実機single再試行、反復検知率、実際の運転振動への耐性は未確認。5秒の腕動作は運転振動の代用ではない。試験波形、設定候補、詳細分析は[`diagnostics/tap/2026-10-05/`](../diagnostics/tap/2026-10-05/analysis.md)。
 
-実測した `TAP_SRC` の値（FW `0.0.85`〜`0.0.87`、Z軸・0.5 g）:
+診断専用のRX `[0x52,0]`はカウンタを読み、`[0x52,1]`はクリアして読み出す。TX `0xD5`は43 byte（6×u32: サンプル数、FIFO欠落、候補、採用、幅棄却、旧方向棄却。4×f32: 重力除去後XYZ各軸peakとZ最大sample差）。0.0.110以降、横方向peakによる終了時棄却は廃止されたため、旧方向棄却counterは常に0。接続時の`0xD0`はレジスタsnapshotを維持し、`read_ret`はFIFO読み出し結果、`nonzero_count`はsoftware判定数を表す。内蔵tap-sourceの`0xD1`は送信しない。RX `0x50`が書けるのは旧tap設定4 registerのみ（software閾値には影響しない）。ODR、range、power mode、INT1 routingは書込拒否。`0x51`のIMU register readは従来どおり。
 
-| 操作 | 350 ms後の `TAP_SRC` | 判定 |
-|------|---------------------|------|
-| ダブルタップ | `0x51` / `0x59`（`TAP_IA\|DOUBLE\|Z`） | double → `0x12` |
-| シングルタップ | `0x00` | single → `0x14` |
+#### 合成波形テスト
 
-このセンサーは `SINGLE_DOUBLE_TAP=1` のとき **`TAP_IA` をダブル確定時にしか
-立てない**。単打では窓が閉じた時点で `TAP_SRC` が `0x00` までクリアされるため、
-シングルを `TAP_IA` でマッチさせることはできない。INT1にタップ以外が載っていない
-ことを利用し、**「INT1が上がった、かつダブルが確定しなかった」＝シングル**と
-推定する。
+```bash
+cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
+  -Inordic-main/src nordic-main/tests/tap_detector_test.c \
+  nordic-main/src/tap_detector.c -lm -o /tmp/tap_detector_test
+/tmp/tap_detector_test
+python3 -m unittest discover -s mac_client -p test_tap_lab.py
+```
 
-過去に修正した派生バグも記録しておく（いずれも実在したが、上記が本体）:
-
-- **クールダウン共有（`0.0.76`〜`0.0.80`）**: single と double が1つの
-  タイムスタンプを共有していたため、仮にsingleが先に出ると700 ms間doubleが
-  無言で捨てられた。`0.0.81` で `tap_last_single_ms` / `tap_last_double_ms` に分離。
-  確定タップはすべてsingleのクールダウンを刻むが、doubleのクールダウンを
-  刻めるのはdoubleだけ。クールダウンで捨てたタップは必ず printk する。
-- **毎ループの無条件 `TAP_SRC` ポーリング（`0.0.80`〜`0.0.83`、未リリース）**:
-  ドライバのエッジ取りこぼし対策として入れたものだが、25 ms ごとにラッチを
-  解除するため上記の中断を最悪化させていた。INT1レベル監視＋遅延読み出しに置換。
-
-#### タップ系の診断
-
-USBシリアルなしで実機を追えるよう、タップ経路はBLEへ計装済み。
-
-- `0xD0`（接続確立時に1回、`0.0.88+`。実際の送信は購読完了後、`0.0.90+`）: `CTRL1_XL` `CTRL6_C` `TAP_CFG` `TAP_THS_6D` `INT_DUR2`
-  `WAKE_UP_THS` `MD1_CFG` `INT1_CTRL` の実値、`TAP_SRC`読み出しの戻り値、
-  非ゼロ検出回数、INT1のレベル。レジスタが期待どおりかを一目で確認できる。
-- `0xD1`: 判定に使った生の `TAP_SRC`。どの軸が立ったか、`TAP_IA` / `DOUBLE` /
-  `SINGLE` のどれが立ったかがそのまま読める。
-- RX `0x50` / `0x51`: OTAなしで閾値・軸・Durationを実機で振る。個別レジスタは
-  `0x51` → `0xD2` で任意のタイミングで読めるので、`0xD0` の定期配信は不要。
-
-`0.0.87` までは `0xD0` を2秒周期で全接続へ流していた（真因特定用の計装）。
-帯域は無視できるが、Android の `BleManager` が高レート系以外を全部hexダンプするため
-logcat が2秒ごとに埋まり、Node も2秒ごとにI2Cを8回叩いていた。`0.0.88` で
-接続時1回に変更。
+24のC検出ケース、C設定範囲検証、最大幅変更後の幅広い衝撃を確認。Python側ではbaseline replay、設定wire、invalid values、FIFO gapを含む5ケースを確認する。合成波形は実機の検知率・運転振動耐性を示すものではない。
 
 #### 接続時通知は購読完了を待つ（`0.0.90` で修正）
 
@@ -575,7 +511,8 @@ if (value != ccc->value) { ccc->value = value; ccc->cfg_changed(attr, value); }
 **接続直後に何かを通知したくなったら、`ble_connected()` でもCCCDコールバックでもなく、
 `bt_gatt_is_subscribed()` を接続ごとにポーリングすること。**
 
-正常時の期待値: `CTRL1_XL=0x60` `CTRL6_C=0x00` `TAP_CFG=0x83` `TAP_THS_6D=0x11`
+通常動作時の期待値（`0.0.107+`）: `CTRL1_XL=0x68` `CTRL6_C=0x00` `TAP_CFG=0x00`。
+以下の旧内蔵検知方式の期待値は履歴: `TAP_THS_6D=0x11`
 `INT_DUR2=0x4a` `WAKE_UP_THS=0x80` `MD1_CFG=0x48` `INT1_CTRL=0x00`。
 
 Mac から `mac_client/tap_monitor.py` で観測する（macOSのBluetooth権限の都合で
@@ -586,7 +523,7 @@ mac_client/venv/bin/python3 mac_client/tap_monitor.py --duration 60
 mac_client/venv/bin/python3 mac_client/tap_monitor.py --duration 45 --write 0x59:0x04
 ```
 
-#### 実機確認結果
+#### 旧内蔵検知方式の実機確認結果（`0.0.107`の検証ではない）
 
 2026-08-24、ファームウェア`0.0.55`をXIAO nRF52840 SenseへOTA適用し、
 部品面を皮膚側にして装着した状態で確認した（当時は double のみ有効）。

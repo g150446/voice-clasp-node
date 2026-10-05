@@ -201,3 +201,35 @@
     もし給餌されていなければ 12 秒の WDT には間に合っていなかった
   - 誤爆防止: `0x60` 単体 / `0x60 0x00` / `0x60 0xB0 0x08` はいずれも無応答・無反応
   - 録音中に送ると `0xD4` の `accepted=0` で拒否され、再起動しない
+
+- 2026-10-04: 0.0.107（加速度FIFOによるソフトウェアsingle/doubleタップ判定）をBLE OTA適用。
+  署名イメージ259596 B。直前のslot 0は0.0.106。更新後slot 0の
+  `version=0.0.107` / `active=true` / `confirmed=true` /
+  hash=`626e8ff1482e71a0`を確認。ログ: `/tmp/harness_ota_0107.log`。
+  合成波形17ケースとsense＋sysbuildのビルド検証済み。実装の実機タップ精度・電流は未測定。
+
+- 2026-10-05: 0.0.108（短い衝撃の段階的な立ち上がりを見逃す問題を修正）をBLE OTA適用。
+  署名イメージ259627 B。更新前slot 0は0.0.107。更新後slot 0の
+  `version=0.0.108` / `active=true` / `confirmed=true` /
+  hash=`df5266a8c33997c1`を確認。ログ: `/tmp/harness_ota_0108.log`。
+  合成波形21ケースとsense＋sysbuildのビルド検証済み。実機タップ精度の再試験は別途行う。
+
+- 2026-10-05: 0.0.109（タップ判定のサンプル数・候補・棄却理由・加速度ピークを読む診断コマンド）をBLE OTA適用。
+  署名イメージ260268 B。更新前slot 0は0.0.108。更新後slot 0の
+  `version=0.0.109` / `active=true` / `confirmed=true` /
+  hash=`ea8bef4d365d1d93`を確認。ログ: `/tmp/harness_ota_0109.log`（終了コード0）。
+  診断はRX `0x52` / TX `0xD5`で要求時のみ送信。実機タップ試験は準備確認後に行う。
+
+- 2026-10-05: 0.0.110（Z方向の立ち上がり後に生じる横方向ピークによる棄却を廃止）をBLE OTA適用。
+  署名イメージ260220 B。更新前slot 0は0.0.109。更新後slot 0の
+  `version=0.0.110` / `active=true` / `confirmed=true` /
+  hash=`bf0c49e842444bc7`を確認。ログ: `/tmp/harness_ota_0110.log`（終了コード0）。
+  合成波形24ケースとsense＋sysbuildのビルド検証済み。実機single/double・振動耐性は再試験が必要。
+
+- 2026-10-05: 0.0.111（最大8秒の加速度・検出器状態保存とBLE経由の一時設定変更）をBLE OTA適用。
+  署名イメージ262563 B。更新前slot 0は0.0.110。更新後slot 0の
+  `version=0.0.111` / `active=true` / `confirmed=true` /
+  hash=`5faec2a57ab1a592`を確認。ログ: `/tmp/harness_ota_0111.log`（終了コード0）。
+  操作不要の実機チェックで416サンプルを取得、FIFO欠落0・飽和0、全サンプルで
+  本番CコードによるPC再生と実機判定状態が一致。ログ: `/tmp/harness_tap_lab_0111_check.log`。
+  実機タップ波形の採取・条件調整は準備確認後に行う。既定条件は0.0.110と同じ。
