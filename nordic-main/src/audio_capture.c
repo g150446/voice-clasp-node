@@ -15,6 +15,7 @@
 #include <zephyr/logging/log.h>
 
 #include "audio_capture.h"
+#include "app_diagnostics.h"
 
 LOG_MODULE_REGISTER(audio_capture, LOG_LEVEL_INF);
 
@@ -69,7 +70,6 @@ int audio_capture_init(void)
 #endif
     if (!device_is_ready(dmic_dev)) {
         LOG_ERR("DMIC device not ready: %s", dmic_dev->name);
-        printk("!!! DMIC device not ready: %s\n", dmic_dev->name);
         return -ENODEV;
     }
 
@@ -98,15 +98,14 @@ int audio_capture_init(void)
     int ret = dmic_configure(dmic_dev, &cfg);
     if (ret < 0) {
         LOG_ERR("DMIC configure failed: %d", ret);
-        printk("!!! DMIC configure failed: %d\n", ret);
         return ret;
     }
 
     dmic_configured = true;
 
-    LOG_INF("Audio capture initialized: %d Hz, %d-bit, %d ch, %d ms frames",
+    APP_INFO("Audio capture initialized: %d Hz, %d-bit, %d ch, %d ms frames",
             SAMPLE_RATE, SAMPLE_BITS, CHANNELS, FRAME_MS);
-    printk("Audio init OK: %d Hz, %d samples/frame\n", SAMPLE_RATE, FRAME_SAMPLES);
+    APP_TRACE("Audio init OK: %d Hz, %d samples/frame\n", SAMPLE_RATE, FRAME_SAMPLES);
     return 0;
 }
 
@@ -123,7 +122,6 @@ int audio_capture_start(void)
     int ret = dmic_trigger(dmic_dev, DMIC_TRIGGER_START);
     if (ret < 0) {
         LOG_ERR("DMIC start failed: %d", ret);
-        printk("!!! DMIC start failed: %d\n", ret);
         return ret;
     }
     pdm_hw_running = true;
@@ -149,14 +147,14 @@ int audio_capture_start(void)
         dc /= (int32_t)n;
         k_mem_slab_free(&pdm_mem_slab, blk);
         if (dc > -200 && dc < 200) {
-            printk("PDM settled after %d frames (DC=%d)\n", i + 1, (int)dc);
+            APP_TRACE("PDM settled after %d frames (DC=%d)\n", i + 1, (int)dc);
             break;
         }
     }
 
     dmic_started = true;
-    LOG_INF("Audio capture started");
-    printk("Audio started\n");
+    APP_INFO("Audio capture started");
+    APP_TRACE("Audio started\n");
     return 0;
 }
 
@@ -179,7 +177,7 @@ int audio_capture_stop(void)
     }
 
     dmic_started = false;
-    LOG_INF("Audio capture stopped");
+    APP_INFO("Audio capture stopped");
     return 0;
 }
 

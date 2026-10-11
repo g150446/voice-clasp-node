@@ -50,9 +50,18 @@
 #include <math.h>
 
 #include "audio_capture.h"
+#include "app_diagnostics.h"
 #include "tap_detector.h"
+#include "tap_processing.h"
+#include "debug_session.h"
 
 LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
+
+/* Atomic mirror for diagnostics in the audio / Bluetooth threads. Policy and
+ * owner lifetime are managed solely by the main loop. Arguments are not
+ * evaluated when diagnostics are off. Deferred Zephyr logging is retained. */
+static atomic_t debug_active;
+bool app_debug_enabled(void) { return atomic_get(&debug_active) != 0; }
 
 /* ============================================================================
  * Configuration
@@ -81,11 +90,13 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 #define ADV_LED_ON_MS           200
 #define ADV_LED_OFF_MS          1800
 /* Unconnected this long → SYSTEMOFF.  Two tiers: a peer that was connected and
- * went away is probably coming back (Doze, out of range, app restart), and
- * sleeping after 3 min turned every transient drop into "the device is gone
- * until someone double-taps it". */
+ * went away is probably coming back (Doze, out of range, app restart), so the
+ * post-drop fuse keeps a reconnect buffer.  It was 30 min, but the software tap
+ * classifier polls the IMU every MAIN_LOOP_INTERVAL_MS while awake, so that long
+ * window dominated standby drain after every connect.  5 min keeps a transient-
+ * drop buffer yet caps the idle cost; a drop past it is resumed by a tap. */
 #define ADV_NO_CONN_SLEEP_MS     (3 * 60 * 1000)   /* cold boot / after tap wake */
-#define ADV_AFTER_DROP_SLEEP_MS  (30 * 60 * 1000)  /* after losing a peer */
+#define ADV_AFTER_DROP_SLEEP_MS  (5 * 60 * 1000)   /* after losing a peer */
 #define ADV_LOW_BATT_PCT         15   /* below this, sleep on the short fuse */
 #define HEARTBEAT_INTERVAL_MS    30000
 #define MAIN_LOOP_STALL_WARN_MS  500
@@ -135,7 +146,6 @@ BUILD_ASSERT(ACCEL_ODR_HZ == TAP_SAMPLE_HZ);
 #define LSM6DS3TR_C_REG_FIFO_DATA     0x3E
 #define TAP_FIFO_RUNNING             0x36 /* ODR=416 Hz, continuous mode */
 #define TAP_FIFO_MAX_SAMPLES         64   /* bound main-loop work / stale data */
-#define TAP_RAW_TO_G                 0.000122f /* +/-4 g */
 #define LSM6DS3TR_C_REG_INT1_CTRL      0x0D
 #define LSM6DS3TR_C_REG_CTRL1_XL       0x10
 #define LSM6DS3TR_C_REG_CTRL6_C        0x15
@@ -149,7 +159,7 @@ BUILD_ASSERT(ACCEL_ODR_HZ == TAP_SAMPLE_HZ);
 #define LSM6DS3TR_C_TAP_CFG_MASK       (BIT(7) | BIT(3) | BIT(2) | BIT(1) | BIT(0))
 #define LSM6DS3TR_C_TAP_CFG_Z_LATCHED  (BIT(7) | BIT(1) | BIT(0))
 #define LSM6DS3TR_C_TAP_THS_MASK       0x1F
-#define LSM6DS3TR_C_TAP_THS_BALANCED   0x08 /* 1 g at +/-4 g, wake only */
+#define LSM6DS3TR_C_TAP_THS_BALANCED   0x08 /* ~1 g wake tap at +/-4 g, wake only */
 #define LSM6DS3TR_C_INT_DUR_BALANCED   0x4A
 #define LSM6DS3TR_C_DOUBLE_TAP_ENABLE  BIT(7)
 #define LSM6DS3TR_C_MD1_TAP_MASK       (BIT(6) | BIT(3))
@@ -497,6 +507,9 @@ static volatile bool capture_enabled;
 static volatile bool capture_fatal;
 static volatile uint8_t operation_mode = OPERATION_MODE_NORMAL;
 static volatile uint8_t operation_mode_pending = OPERATION_MODE_PENDING_NONE;
+K_SEM_DEFINE(audio_control_wake, 0, 1);
+K_SEM_DEFINE(audio_capture_wake, 0, 1);
+K_MSGQ_DEFINE(serial_rx_q, sizeof(uint8_t), 64, 1);
 K_SEM_DEFINE(audio_notify_slots, AUDIO_NOTIFY_IN_FLIGHT, AUDIO_NOTIFY_IN_FLIGHT);
 
 struct audio_pcm_frame {
@@ -618,9 +631,9 @@ static void conn_param_work_handler(struct k_work *work)
          * and le_param_updated() is the only proof it was accepted. */
         int ret = bt_conn_le_param_update(connections[i], p);
         if (ret) {
-            printk(">>> conn_param[%d] request failed: %d\n", i, ret);
+            LOG_WRN(">>> conn_param[%d] request failed: %d\n", i, ret);
         } else {
-            printk(">>> conn_param[%d]: %s requested (host sends at T+5s)\n",
+            APP_TRACE(">>> conn_param[%d]: %s requested (host sends at T+5s)\n",
                    i, label);
         }
     }
@@ -648,19 +661,19 @@ static uint32_t tap_capture_gaps;
 static int64_t tap_capture_deadline_ms;
 static bool tap_capture_active, tap_capture_gap;
 struct tap_debug_command {
+    struct bt_conn *conn; /* queue owns a reference until processed */
     uint8_t command, op;
     uint16_t arg;
     struct tap_config config;
 };
 K_MSGQ_DEFINE(tap_debug_queue, sizeof(struct tap_debug_command), 4, 4);
+static struct debug_session debug_session;
+static struct bt_conn *debug_owner; /* extra reference while enabled */
 static bool tap_fifo_ready;
 /* On-demand diagnostics for missed taps; no periodic BLE traffic. Main-loop
  * ownership keeps snapshots/reset coherent with the sample processing. */
 static atomic_t tap_stats_request;
-static struct {
-    uint32_t samples, discontinuities, candidates, strikes, broad, lateral;
-    float peak[3], edge;
-} tap_stats;
+static struct tap_metrics tap_stats;
 static int tap_last_read_ret;
 static uint16_t tap_nonzero_count;
 /* Per-connection greeting (mode status + one tap-register snapshot).
@@ -1075,16 +1088,16 @@ static void log_reset_cause(void)
     hwinfo_get_reset_cause(&cause);
     hwinfo_clear_reset_cause();
 
-    printk("Reset cause: 0x%08x", cause);
-    if (cause & RESET_WATCHDOG)   printk(" [WATCHDOG — firmware hang]");
-    if (cause & RESET_BROWNOUT)   printk(" [BROWNOUT — low voltage/battery]");
-    if (cause & RESET_PIN)        printk(" [PIN — external reset]");
-    if (cause & RESET_SOFTWARE)   printk(" [SOFTWARE]");
-    if (cause & RESET_CPU_LOCKUP) printk(" [CPU_LOCKUP]");
-    if (cause & RESET_POR)        printk(" [POR — power-on]");
-    if (cause & RESET_LOW_POWER_WAKE) printk(" [LOW_POWER_WAKE — SYSTEMOFF]");
-    if (cause == 0)               printk(" [POR — power-on / battery removed]");
-    printk("\n");
+    APP_TRACE("Reset cause: 0x%08x", cause);
+    if (cause & RESET_WATCHDOG)   APP_TRACE(" [WATCHDOG — firmware hang]");
+    if (cause & RESET_BROWNOUT)   APP_TRACE(" [BROWNOUT — low voltage/battery]");
+    if (cause & RESET_PIN)        APP_TRACE(" [PIN — external reset]");
+    if (cause & RESET_SOFTWARE)   APP_TRACE(" [SOFTWARE]");
+    if (cause & RESET_CPU_LOCKUP) APP_TRACE(" [CPU_LOCKUP]");
+    if (cause & RESET_POR)        APP_TRACE(" [POR — power-on]");
+    if (cause & RESET_LOW_POWER_WAKE) APP_TRACE(" [LOW_POWER_WAKE — SYSTEMOFF]");
+    if (cause == 0)               APP_TRACE(" [POR — power-on / battery removed]");
+    APP_TRACE("\n");
 
     boot_reset_cause = cause;
 
@@ -1094,11 +1107,11 @@ static void log_reset_cause(void)
         boot_crash_up_s  = (uint16_t)MIN(cb.up_s, 0xFFFFU);
         boot_crash_hb    = (uint16_t)MIN(cb.hb_seq, 0xFFFFU);
         boot_crash_ndrop = (uint16_t)MIN(cb.ndrop, 0xFFFFU);
-        printk(">>> CRASHBOX stage=%u(%s) up=%us hb=%u conns=%u rec=%u ndrop=%u\n",
+        APP_TRACE(">>> CRASHBOX stage=%u(%s) up=%us hb=%u conns=%u rec=%u ndrop=%u\n",
                cb.stage, stage_str(cb.stage), cb.up_s, cb.hb_seq,
                cb.conns, cb.recording, cb.ndrop);
     } else {
-        printk(">>> CRASHBOX: none (cold boot or SYSTEMOFF wake)\n");
+        APP_TRACE(">>> CRASHBOX: none (cold boot or SYSTEMOFF wake)\n");
     }
     memset(&cb, 0, sizeof(cb));
     cb.magic = CRASHBOX_MAGIC;
@@ -1123,8 +1136,8 @@ static void configure_watchdog(void)
         LOG_ERR("WDT setup failed");
         return;
     }
-    LOG_INF("WDT armed: %d ms timeout", WDT_TIMEOUT_MS);
-    printk("Watchdog armed (%d ms)\n", WDT_TIMEOUT_MS);
+    APP_INFO("WDT armed: %d ms timeout", WDT_TIMEOUT_MS);
+    APP_TRACE("Watchdog armed (%d ms)\n", WDT_TIMEOUT_MS);
 }
 
 /* ============================================================================
@@ -1149,7 +1162,7 @@ static int battery_init(void)
         LOG_WRN("Battery enable GPIO not ready");
     }
     bat_adc_ready = true;
-    LOG_INF("Battery ADC ready (AIN7/P0.31, enable P0.14)");
+    APP_INFO("Battery ADC ready (AIN7/P0.31, enable P0.14)");
     return 0;
 }
 
@@ -1214,7 +1227,7 @@ static void battery_update(void)
     if (vbus && !bat_vbus_prev) {
         bat_charge_start_ms  = k_uptime_get_32();
         bat_charge_start_pct = bat_last_pct;
-        LOG_INF("Battery: USB connected, charging from %d%%", bat_charge_start_pct);
+        APP_INFO("Battery: USB connected, charging from %d%%", bat_charge_start_pct);
     }
     bat_vbus_prev = vbus;
 
@@ -1226,8 +1239,8 @@ static void battery_update(void)
                              / (BATTERY_CAPACITY_MAH * 60U);
         uint8_t est_pct = (uint8_t)MIN(bat_charge_start_pct + added_pct,
                                        BATTERY_CHARGE_MAX_EST_PCT);
-        LOG_INF("Battery: charging ~%d%% (est, %u min)", est_pct, elapsed_min);
-        printk("Battery: charging ~%d%% (est, %u min)\n", est_pct, elapsed_min);
+        APP_INFO("Battery: charging ~%d%% (est, %u min)", est_pct, elapsed_min);
+        APP_TRACE("Battery: charging ~%d%% (est, %u min)\n", est_pct, elapsed_min);
         bt_bas_set_battery_level(est_pct);
         return;
     }
@@ -1240,8 +1253,8 @@ static void battery_update(void)
     }
     uint8_t pct = battery_millivolt_to_percent(mv);
     bat_last_pct = pct;
-    LOG_INF("Battery: %d mV (%d%%)", mv, pct);
-    printk("Battery: %d mV (%d%%)\n", mv, pct);
+    APP_INFO("Battery: %d mV (%d%%)", mv, pct);
+    APP_TRACE("Battery: %d mV (%d%%)\n", mv, pct);
     bt_bas_set_battery_level(pct);
 }
 
@@ -1262,13 +1275,13 @@ static void mic_power_on(void)
 {
     gpio_pin_set_dt(&mic_pwr, 1);
     k_msleep(50);   /* wait for MEMS bias to stabilise */
-    printk("Mic power ON\n");
+    APP_TRACE("Mic power ON\n");
 }
 
 static void mic_power_off(void)
 {
     gpio_pin_set_dt(&mic_pwr, 0);
-    printk("Mic power OFF\n");
+    APP_TRACE("Mic power OFF\n");
 }
 
 /* Forward declarations */
@@ -1287,6 +1300,7 @@ static void flush_host_collection(void);
 static void process_tap_event(int64_t now);
 static void send_tap_diag(void);
 static void send_tap_reg_ack(uint8_t reg, uint8_t value, int ret);
+
 static void apply_pending_operation_mode(void);
 static void send_operation_mode_status(void);
 static bool gesture_detect_effective(void);
@@ -1398,7 +1412,7 @@ static void accumulate_calibration(double x, double y, double z)
     calibration_count++;
 
     if (calibration_count == CALIBRATION_SAMPLES) {
-        LOG_INF("Baseline ready: accel=(%.3f, %.3f, %.3f) m/s^2",
+        APP_INFO("Baseline ready: accel=(%.3f, %.3f, %.3f) m/s^2",
                 baseline_x, baseline_y, baseline_z);
         previous_accel_x = baseline_x;
         previous_accel_y = baseline_y;
@@ -1445,9 +1459,9 @@ static int configure_motion_detection(void)
 
     gyro_enabled = false;
     gyro_sample_valid = false;
-    LOG_INF("Motion detection ready: accel=%d Hz gyro=on-demand@%d Hz, sample=%d ms",
+    APP_INFO("Motion detection ready: accel=%d Hz gyro=on-demand@%d Hz, sample=%d ms",
             ACCEL_ODR_HZ, GYRO_ODR_HZ, MOTION_SAMPLE_INTERVAL_MS);
-    LOG_INF("Calibrating for %.1f s; keep the board still",
+    APP_INFO("Calibrating for %.1f s; keep the board still",
             (double)(CALIBRATION_SAMPLES * MOTION_SAMPLE_INTERVAL_MS) / 1000.0);
     return 0;
 }
@@ -1504,6 +1518,12 @@ static int configure_tap_detection(void)
                           SENSOR_ATTR_SAMPLING_FREQUENCY, &odr);
     if (ret < 0) return ret;
     struct sensor_value range;
+    /* +/-4 g is required, not just sufficient: the SAME accelerometer feeds the
+     * gesture path whose thresholds (e.g. GESTURE_LIFT_ACCEL_MIN_MS2 0.40 m/s^2
+     * = 0.041 g) need resolution finer than a +/-8 g LSB (0.244 g). Widening to
+     * 8 g to separate hard taps from maximal wrist jerks would break gesture
+     * detection, and a maximal jerk is physically a hard transient anyway, so it
+     * is not separable by range or peak gate without losing real taps. */
     sensor_g_to_ms2(4, &range);
     ret = sensor_attr_set(imu, SENSOR_CHAN_ACCEL_XYZ,
                           SENSOR_ATTR_FULL_SCALE, &range);
@@ -1517,7 +1537,7 @@ static int configure_tap_detection(void)
                              fifo_config, sizeof(fifo_config));
     if (ret < 0) return ret;
     ret = reset_tap_fifo();
-    if (ret == 0) LOG_INF("Software tap ready: acceleration FIFO 416 Hz +/-4g");
+    if (ret == 0) APP_INFO("Software tap ready: acceleration FIFO 416 Hz +/-4g");
     return ret;
 }
 
@@ -1592,13 +1612,13 @@ static void gyro_set_enabled(bool enable)
         gyro_enabled_since_ms = k_uptime_get();
         gyro_sample_valid = false;
         gyro_reset_phase_metrics();
-        printk(">>> Gyro ON (%d Hz)\n", GYRO_ODR_HZ);
+        APP_TRACE(">>> Gyro ON (%d Hz)\n", GYRO_ODR_HZ);
         send_gesture_diag(GESTURE_DIAG_GYRO_ENABLED, GESTURE_DIAG_REASON_NONE,
                           (float)GYRO_ODR_HZ, gyro_bias_y_dps,
                           gyro_bias_valid ? 1.0f : 0.0f);
     } else {
         gyro_sample_valid = false;
-        printk(">>> Gyro OFF\n");
+        APP_TRACE(">>> Gyro OFF\n");
         send_gesture_diag(GESTURE_DIAG_GYRO_DISABLED, GESTURE_DIAG_REASON_NONE,
                           gesture_gyro_roll_deg, gesture_gyro_peak_abs_dps,
                           0.0f);
@@ -1688,7 +1708,7 @@ static void gesture_history_push(uint8_t stage, uint8_t reason,
 {
     gesture_history_entry_t *e;
 
-    if (!gesture_capture_enabled) {
+    if (!atomic_get(&debug_active) || !gesture_capture_enabled) {
         return;
     }
     if (gesture_history_count == 0) {
@@ -1726,7 +1746,7 @@ static void gesture_trajectory_clear(void)
     gesture_trajectory_reason = GESTURE_DIAG_REASON_NONE;
     /* Staying inactive makes every push, finish and flush a no-op, so the
      * capture switch costs nothing but this branch while it is off. */
-    gesture_trajectory_active = gesture_capture_enabled;
+    gesture_trajectory_active = atomic_get(&debug_active) && gesture_capture_enabled;
     gesture_trajectory_committed = false;
     gesture_trajectory_overflow = false;
     gesture_trajectory_flush_pending = false;
@@ -1748,7 +1768,7 @@ static void gesture_trajectory_push(int64_t now, uint8_t flags,
     gesture_trajectory_sample_t *sample;
     int64_t dt;
 
-    if (!gesture_trajectory_active) {
+    if (!atomic_get(&debug_active) || !gesture_trajectory_active) {
         return;
     }
     if (gesture_trajectory_count >= GESTURE_TRAJECTORY_CAP) {
@@ -1769,7 +1789,7 @@ static void gesture_trajectory_push(int64_t now, uint8_t flags,
 
 static void gesture_trajectory_finish(uint8_t result, uint8_t reason)
 {
-    if (!gesture_trajectory_active || !gesture_trajectory_committed) {
+    if (!atomic_get(&debug_active) || !gesture_trajectory_active || !gesture_trajectory_committed) {
         return;
     }
     gesture_trajectory_active = false;
@@ -1790,7 +1810,7 @@ static bool gesture_host_collection_start(void)
     gesture_host_collection_overflow = false;
     gesture_host_collection_active = true;
     gyro_set_enabled(true);
-    printk(">>> Host IMU collection started: %d ms\n",
+    APP_TRACE(">>> Host IMU collection started: %d ms\n",
            GESTURE_HOST_COLLECTION_MS);
     return true;
 }
@@ -1824,7 +1844,7 @@ static void gesture_host_collection_push(int64_t now, uint8_t flags,
     if (dt >= GESTURE_HOST_COLLECTION_MS) {
         gesture_host_collection_active = false;
         gesture_host_collection_flush_pending = true;
-        printk(">>> Host IMU collection complete: %u samples\n",
+        APP_TRACE(">>> Host IMU collection complete: %u samples\n",
                gesture_host_collection_count);
     }
 }
@@ -2025,7 +2045,7 @@ static void emit_recording_stop_near_miss(int64_t now, uint8_t reason,
         return;
     }
     recording_stop_near_miss_last_ms = now;
-    printk(">>> Stop near-miss reason=0x%02x opp=%.3f peak=%.2f "
+    APP_TRACE(">>> Stop near-miss reason=0x%02x opp=%.3f peak=%.2f "
            "pulse=%.0f need=%.3f\n",
            reason,
            (double)recording_stop_opp_impulse_ms,
@@ -2096,7 +2116,7 @@ static void request_recording_stop_hand_lower(int64_t now)
     float pulse_ms = recording_stop_pulse_ms_latched;
 
     (void)now;
-    printk(">>> Hand-lower while recording → stop opp_imp=%.3f peak=%.2f "
+    APP_TRACE(">>> Hand-lower while recording → stop opp_imp=%.3f peak=%.2f "
            "pulse=%.0fms lift_imp=%.3f\n",
            (double)recording_stop_opp_impulse_ms,
            (double)recording_stop_opp_peak_ms2,
@@ -2107,6 +2127,7 @@ static void request_recording_stop_hand_lower(int64_t now)
                       recording_stop_opp_peak_ms2,
                       pulse_ms);
     stop_requested = true;
+    k_sem_give(&audio_control_wake);
     inhibit_next_settle = true;
     gesture_block_until_ms = now + GESTURE_RETRIGGER_BLOCK_MS;
     reset_recording_stop_state();
@@ -2329,7 +2350,7 @@ static void emit_lift_near_miss(int64_t now, uint8_t reason, float elapsed_ms)
         return;
     }
     gesture_lift_near_miss_last_ms = now;
-    printk(">>> Lift near-miss reason=0x%02x peak_a_up=%.2f imp=%.3f "
+    APP_TRACE(">>> Lift near-miss reason=0x%02x peak_a_up=%.2f imp=%.3f "
            "elapsed=%.0fms\n",
            reason,
            (double)gesture_lift_peak_a_up_ms2,
@@ -2417,9 +2438,9 @@ static void emit_tap_event(int64_t now, bool is_double)
         if (light_sleep_active) {
             light_sleep_active = false;
             send_event_packet(0x21);
-            printk(">>> Light sleep wake (single tap)\n");
+            APP_TRACE(">>> Light sleep wake (single tap)\n");
         }
-        printk(">>> Single tap detected (software acceleration)\n");
+        APP_TRACE(">>> Single tap detected (software acceleration)\n");
         send_event_packet(EVT_SINGLE_TAP);
         return;
     }
@@ -2444,10 +2465,10 @@ static void emit_tap_event(int64_t now, bool is_double)
     if (light_sleep_active) {
         light_sleep_active = false;
         send_event_packet(0x21);
-        printk(">>> Light sleep wake (double tap)\n");
+        APP_TRACE(">>> Light sleep wake (double tap)\n");
     }
     last_activity_ms = now;
-    printk(">>> Double tap detected (software acceleration)\n");
+    APP_TRACE(">>> Double tap detected (software acceleration)\n");
     send_event_packet(EVT_DOUBLE_TAP);
 }
 
@@ -2476,7 +2497,6 @@ static void process_tap_event(int64_t now)
         goto lost_samples;
     }
     for (unsigned n = 0; n < samples; n++) {
-        float accel[3];
         int16_t capture_raw[3];
         /* FIFO output is a 16-bit port, NOT the normal XYZ register bank.
          * Read one word per transaction; do not assume 6-byte auto-wrap. */
@@ -2486,42 +2506,15 @@ static void process_tap_event(int64_t now)
                                    raw, sizeof(raw));
             if (ret < 0) goto lost_samples;
             capture_raw[axis] = (int16_t)sys_get_le16(raw);
-            accel[axis] = capture_raw[axis] * TAP_RAW_TO_G;
         }
-        bool was_pulse = software_tap.pulse;
-        bool was_rejected = software_tap.pulse_rejected;
-        uint64_t previous_strike = software_tap.last_strike;
-        if (software_tap.initialized) {
-            for (unsigned axis = 0; axis < 3; axis++) {
-                float linear = accel[axis] - software_tap.gravity[axis];
-                tap_stats.peak[axis] = fmaxf(tap_stats.peak[axis], fabsf(linear));
-                if (axis == 2) {
-                    tap_stats.edge = fmaxf(tap_stats.edge,
-                                           fabsf(linear - software_tap.previous_z));
-                }
-            }
-        }
-        tap_stats.samples++;
-        enum tap_result result = tap_detector_push_config(&software_tap,
-                        accel[0], accel[1], accel[2], &tap_live_config);
-        if (!was_pulse && software_tap.pulse) tap_stats.candidates++;
-        if (!was_rejected && software_tap.pulse_rejected) tap_stats.broad++;
-        if (software_tap.last_strike != previous_strike) tap_stats.strikes++;
-        if (was_pulse && !software_tap.pulse && !software_tap.pulse_rejected &&
-            software_tap.last_strike == previous_strike) tap_stats.lateral++;
+        uint16_t flags;
+        enum tap_result result = tap_process_sample(&software_tap, &tap_live_config,
+            capture_raw, atomic_get(&debug_active) ? &tap_stats : NULL,
+            tap_capture_active ? &flags : NULL);
         if (tap_capture_active) {
             struct tap_capture_sample *v = &tap_capture[tap_capture_count++];
             memcpy(v->raw, capture_raw, sizeof(v->raw));
-            v->flags = (software_tap.pulse ? 1 : 0) |
-                (software_tap.pulse_rejected ? 2 : 0) |
-                (software_tap.pending ? 4 : 0) |
-                (software_tap.last_strike != previous_strike ? 8 : 0) |
-                (result == TAP_SINGLE ? 16 : 0) | (result == TAP_DOUBLE ? 32 : 0) |
-                (tap_capture_gap ? 64 : 0);
-            for (unsigned axis = 0; axis < 3; axis++) {
-                if (capture_raw[axis] >= 32760 || capture_raw[axis] <= -32760)
-                    v->flags |= 128;
-            }
+            v->flags = flags | (tap_capture_gap ? 64 : 0);
             tap_capture_gap = false;
             if (tap_capture_count >= tap_capture_target) tap_capture_active = false;
         }
@@ -2534,7 +2527,7 @@ static void process_tap_event(int64_t now)
 
 lost_samples:
     if (tap_capture_active) { tap_capture_gap = true; tap_capture_gaps++; }
-    tap_stats.discontinuities++;
+    if (atomic_get(&debug_active)) tap_stats.discontinuities++;
     tap_last_read_ret = ret < 0 ? ret : -EOVERFLOW;
     if (ret < 0) LOG_WRN("Tap FIFO read failed: %d", ret);
     (void)reset_tap_fifo();
@@ -2543,7 +2536,7 @@ lost_samples:
 static void process_tap_stats_request(void)
 {
     int request = atomic_set(&tap_stats_request, 0);
-    if (!request) return;
+    if (!request || !atomic_get(&debug_active)) return;
     if (request == 2) memset(&tap_stats, 0, sizeof(tap_stats));
     uint8_t pkt[43] = {0x00, 0x55, 0xD5};
     const uint32_t counters[] = {tap_stats.samples, tap_stats.discontinuities,
@@ -2579,15 +2572,89 @@ static void tap_config_wire(struct tap_config *c, uint8_t *wire, bool decode)
     }
 }
 
-static void process_tap_debug_command(void)
+static void send_debug_status(struct bt_conn *conn, uint8_t op, uint8_t status)
 {
-    /* An IMU failure must not leave capture/configuration permanently busy. */
-    if (tap_capture_active && k_uptime_get() > tap_capture_deadline_ms) {
-        tap_capture_active = false;
-        tap_capture_gaps++;
+    uint8_t pkt[8] = {0, 0x55, 0xD8, op, status,
+                     debug_session_enabled(&debug_session) ? 1 : 0};
+    sys_put_le16(debug_session_remaining(&debug_session, k_uptime_get()), pkt + 6);
+    notify_one(conn, pkt, sizeof(pkt));
+}
+
+static void debug_cleanup(void)
+{
+    atomic_clear(&debug_active);
+    tap_capture_active = false;
+    tap_capture_target = tap_capture_count = 0;
+    atomic_clear(&tap_stats_request);
+    memset(&tap_stats, 0, sizeof(tap_stats));
+#if GESTURE_DEBUG_HISTORY
+    bool was_host_collection = gesture_host_collection_active || gesture_host_collection_flush_pending;
+    gesture_capture_enabled = false;
+    gesture_trajectory_discard();
+    gesture_history_clear();
+    gesture_host_collection_active = false;
+    gesture_host_collection_flush_pending = false;
+    gesture_host_collection_count = 0;
+    if (was_host_collection && gesture_phase == GESTURE_WAITING &&
+        !is_recording && !recording_requested) gyro_set_enabled(false);
+#endif
+    if (debug_owner) { bt_conn_unref(debug_owner); debug_owner = NULL; }
+}
+
+static void handle_debug_command(const struct tap_debug_command *command)
+{
+    struct tap_debug_command cmd = *command;
+    struct bt_conn_info info;
+    /* A queued command from a disconnected peer must not activate diagnostics. */
+    if (bt_conn_get_info(cmd.conn, &info) || info.state != BT_CONN_STATE_CONNECTED) return;
+    if (cmd.command == 0x55) {
+        uint8_t result = debug_session_request(&debug_session, cmd.op,
+                                               (uintptr_t)cmd.conn, k_uptime_get());
+        if (result == DEBUG_OK && cmd.op == 1) {
+            if (!debug_owner) {
+                debug_owner = bt_conn_ref(cmd.conn);
+                memset(&tap_stats, 0, sizeof(tap_stats));
+            }
+            atomic_set(&debug_active, 1);
+        } else if (result == DEBUG_OK && cmd.op == 2) {
+            debug_cleanup();
+        }
+        send_debug_status(cmd.conn, cmd.op, result);
+        return;
     }
-    struct tap_debug_command cmd;
-    if (k_msgq_get(&tap_debug_queue, &cmd, K_NO_WAIT)) return;
+    bool config_read = cmd.command == 0x54 && cmd.op == 0;
+    if (!config_read && !debug_session_allowed(&debug_session, (uintptr_t)cmd.conn)) {
+        send_debug_status(cmd.conn, cmd.command,
+                          debug_session_enabled(&debug_session) ? DEBUG_BUSY : DEBUG_REQUIRED);
+        return;
+    }
+    if (cmd.command == 0x52) {
+        atomic_set(&tap_stats_request, cmd.op ? 2 : 1);
+        return;
+    }
+    if (cmd.command == CMD_IMU_REG_READ || cmd.command == CMD_IMU_REG_WRITE) {
+        uint8_t reg = cmd.op, value = 0;
+        int ret = 0;
+        if (cmd.command == CMD_IMU_REG_WRITE) {
+            ret = tap_reg_writable(reg) ? i2c_reg_write_byte_dt(&imu_i2c, reg, cmd.arg) : -EPERM;
+        }
+        if (!ret) ret = i2c_reg_read_byte_dt(&imu_i2c, reg, &value);
+        send_tap_reg_ack(reg, value, ret);
+        return;
+    }
+#if GESTURE_DEBUG_HISTORY
+    if (cmd.command == CMD_SET_GESTURE_CAPTURE) {
+        gesture_capture_enabled = cmd.op != 0;
+        if (!gesture_capture_enabled) { gesture_trajectory_discard(); gesture_history_clear(); }
+        send_gesture_capture_status();
+        return;
+    }
+    if (cmd.command == 0x04) {
+        send_debug_status(cmd.conn, cmd.command,
+                          gesture_host_collection_start() ? DEBUG_OK : DEBUG_BUSY);
+        return;
+    }
+#endif
     uint8_t status = 0;
     if (cmd.command == 0x54) {
         if (cmd.op != 0) {
@@ -2645,6 +2712,23 @@ static void process_tap_debug_command(void)
     notify_all_conns(pkt, sizeof(pkt));
 }
 
+static void process_tap_debug_command(void)
+{
+    struct bt_conn_info info;
+    bool connected = debug_owner && !bt_conn_get_info(debug_owner, &info) &&
+                     info.state == BT_CONN_STATE_CONNECTED;
+    if (debug_session_expire(&debug_session, k_uptime_get(), connected)) debug_cleanup();
+    if (tap_capture_active && k_uptime_get() > tap_capture_deadline_ms) {
+        tap_capture_active = false;
+        tap_capture_gaps++;
+    }
+    struct tap_debug_command cmd;
+    if (!k_msgq_get(&tap_debug_queue, &cmd, K_NO_WAIT)) {
+        handle_debug_command(&cmd);
+        bt_conn_unref(cmd.conn);
+    }
+}
+
 static void apply_pending_operation_mode(void)
 {
     uint8_t requested = operation_mode_pending;
@@ -2671,7 +2755,7 @@ static void apply_pending_operation_mode(void)
     operation_mode_pending = OPERATION_MODE_PENDING_NONE;
     reset_gesture_sequence();
     gesture_quiet_since_ms = 0;
-    printk(">>> Operation mode: %s\n",
+    APP_TRACE(">>> Operation mode: %s\n",
            operation_mode == OPERATION_MODE_DRIVING ? "DRIVING" : "NORMAL");
     send_operation_mode_status();
 }
@@ -2976,7 +3060,7 @@ static void process_gesture_sample(float ax, float ay, float az,
             gesture_start_accel_z = gesture_gravity_lp_z;
             reset_gesture_motion();
             clear_accel_history();
-            printk(">>> Gesture palm-up dwell ready: %lld ms z=%.2f\n",
+            APP_TRACE(">>> Gesture palm-up dwell ready: %lld ms z=%.2f\n",
                    now - gesture_palm_candidate_since_ms,
                    (double)palm_up_z_ratio);
             send_gesture_diag(GESTURE_DIAG_OUTBOUND_READY,
@@ -3049,7 +3133,7 @@ static void process_gesture_sample(float ax, float ay, float az,
             gesture_pronation_phi_deg, z_gravity_ratio, az);
         if (!gesture_palm_down_latched && palm_down_now) {
             gesture_palm_down_latched = true;
-            printk(">>> Gesture palm-down latched: phi=%.1f roll=%.1f "
+            APP_TRACE(">>> Gesture palm-down latched: phi=%.1f roll=%.1f "
                    "xy_ratio=%.2f\n",
                    (double)gesture_pronation_phi_deg,
                    (double)gesture_gyro_roll_deg,
@@ -3123,7 +3207,7 @@ static void process_gesture_sample(float ax, float ay, float az,
                     roll_at_lift < GESTURE_LIFT_PREFLIP_MAX_DEG;
                 gesture_lift_stage = GESTURE_LIFT_WAIT_BRAKE;
                 gesture_lift_brake_samples = 0;
-                printk(">>> Gesture lift pulse: roll=%.1f before_flip=%d "
+                APP_TRACE(">>> Gesture lift pulse: roll=%.1f before_flip=%d "
                        "imp=%.3f\n",
                        (double)roll_at_lift,
                        gesture_lift_before_flip ? 1 : 0,
@@ -3330,7 +3414,7 @@ static void process_gesture_sample(float ax, float ay, float az,
                         (!match_lift_ok ? 0x01 : 0x00) |
                         (!match_pronation_ok ? 0x02 : 0x00);
 
-                    printk(">>> Gesture rejected by final gate: "
+                    APP_TRACE(">>> Gesture rejected by final gate: "
                            "impulse=%.3f/%.2f phi=%.1f/%.0f bits=0x%02x\n",
                            (double)gesture_lift_pos_impulse_ms,
                            (double)GESTURE_MATCH_POS_IMPULSE_MIN_MS,
@@ -3371,7 +3455,7 @@ static void process_gesture_sample(float ax, float ay, float az,
                 }
 
                 int64_t motion_ms = now - gesture_lift_event_start_ms;
-                printk(">>> Gesture MATCH: palm-up dwell + lift + palm-down hold\n");
+                APP_TRACE(">>> Gesture MATCH: palm-up dwell + lift + palm-down hold\n");
                 send_gesture_diag(GESTURE_DIAG_MOTION_COMPLETE,
                                   GESTURE_DIAG_REASON_NONE,
                                   (float)motion_ms,
@@ -3412,6 +3496,7 @@ static void process_gesture_sample(float ax, float ay, float az,
                     float gz = gesture_gravity_lp_z;
                     /* Gyro optional during recording; linear stop is primary. */
                     recording_requested = true;
+                    k_sem_give(&audio_control_wake);
                     gesture_block_until_ms = now + GESTURE_RETRIGGER_BLOCK_MS;
                     last_activity_ms = now;
                     reset_gesture_sequence();
@@ -3486,7 +3571,7 @@ static void on_motion_started(float x, float y, float z)
     motion_speed_samples = 0;
 
     send_event_packet_xyz(0x10, x, y, z);
-    printk(">>> Motion active x=%.2f y=%.2f z=%.2f\n", (double)x, (double)y, (double)z);
+    APP_TRACE(">>> Motion active x=%.2f y=%.2f z=%.2f\n", (double)x, (double)y, (double)z);
 }
 
 static void on_motion_settled(float x, float y, float z)
@@ -3500,7 +3585,7 @@ static void on_motion_settled(float x, float y, float z)
         float avg_speed = motion_speed_samples > 0
             ? motion_speed_sum / (float)motion_speed_samples : 0.0f;
         send_event_packet_settle(x, y, z, elapsed_ms, avg_speed, motion_peak_speed, motion_distance);
-        printk(">>> Motion settled x=%.2f y=%.2f z=%.2f elapsed=%u ms avg=%.3f peak=%.3f dist=%.3f\n",
+        APP_TRACE(">>> Motion settled x=%.2f y=%.2f z=%.2f elapsed=%u ms avg=%.3f peak=%.3f dist=%.3f\n",
                (double)x, (double)y, (double)z, elapsed_ms,
                (double)avg_speed, (double)motion_peak_speed, (double)motion_distance);
         return;
@@ -3512,13 +3597,13 @@ static void on_motion_settled(float x, float y, float z)
         ? motion_speed_sum / (float)motion_speed_samples : 0.0f;
     if (inhibit_next_settle) {
         inhibit_next_settle = false;
-        printk(">>> Motion settled (inhibited after recording stop)\n");
+        APP_TRACE(">>> Motion settled (inhibited after recording stop)\n");
         return;
     }
 
     last_motion_time_ms = (uint32_t)k_uptime_get();
     send_event_packet_settle(x, y, z, elapsed_ms, avg_speed, motion_peak_speed, motion_distance);
-    printk(">>> Motion settled x=%.2f y=%.2f z=%.2f elapsed=%u ms avg=%.3f peak=%.3f dist=%.3f\n",
+    APP_TRACE(">>> Motion settled x=%.2f y=%.2f z=%.2f elapsed=%u ms avg=%.3f peak=%.3f dist=%.3f\n",
            (double)x, (double)y, (double)z, elapsed_ms,
            (double)avg_speed, (double)motion_peak_speed, (double)motion_distance);
 
@@ -3621,7 +3706,7 @@ static void process_motion_sample(void)
             z_excursion_peak = abs_double(z - baseline_z);
             atomic_inc(&detected_motion_count);
 
-            LOG_INF("Motion! count=%d activity=%.3f peak=%.3f",
+            APP_INFO("Motion! count=%d activity=%.3f peak=%.3f",
                     (int)atomic_get(&detected_motion_count), activity, peak);
             last_motion_time_ms = now;
             on_motion_started((float)x, (float)y, (float)z);
@@ -3666,7 +3751,7 @@ static void process_motion_sample(void)
         settle_count = 0;
         set_baseline(x, y, z);
         reset_step_window();
-        LOG_INF("Motion settled: baseline=(%.3f, %.3f, %.3f)", x, y, z);
+        APP_INFO("Motion settled: baseline=(%.3f, %.3f, %.3f)", x, y, z);
         on_motion_settled((float)x, (float)y, (float)z);
     }
 }
@@ -3677,8 +3762,8 @@ static void process_motion_sample(void)
 
 static void audio_tx_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value)
 {
-    LOG_INF("Audio TX CCCD updated: %d", value);
-    printk(">>> Audio CCCD: %d (1=notify enabled)\n", value);
+    APP_INFO("Audio TX CCCD updated: %d", value);
+    APP_TRACE(">>> Audio CCCD: %d (1=notify enabled)\n", value);
 }
 
 static ssize_t audio_rx_write(struct bt_conn *conn, const struct bt_gatt_attr *attr,
@@ -3694,22 +3779,25 @@ static ssize_t audio_rx_write(struct bt_conn *conn, const struct bt_gatt_attr *a
                  * Clear the stuck session then start again on the next loop. */
                 stop_requested = true;
                 recording_requested = true;
-                printk(">>> START while recording — restart\n");
+                k_sem_give(&audio_control_wake);
+                APP_TRACE(">>> START while recording — restart\n");
             } else {
-                printk(">>> START command\n");
+                APP_TRACE(">>> START command\n");
                 stop_requested = false;
                 recording_requested = true;
+                k_sem_give(&audio_control_wake);
             }
         } else if (data[0] == 0x00) {
-            printk(">>> STOP command\n");
+            APP_TRACE(">>> STOP command\n");
             stop_requested = true;
+            k_sem_give(&audio_control_wake);
         } else if (data[0] == 0x02) {
             /* Claim primary role */
             int idx = conn_index(conn);
             if (idx >= 0) {
                 primary_idx = idx;
                 inhibit_next_settle = false;
-                printk(">>> conn[%d] claimed primary\n", idx);
+                APP_TRACE(">>> conn[%d] claimed primary\n", idx);
                 /* Update connection params: fast for primary, slow for secondary */
                 k_work_schedule(&conn_param_work, K_MSEC(200));
             }
@@ -3719,7 +3807,7 @@ static ssize_t audio_rx_write(struct bt_conn *conn, const struct bt_gatt_attr *a
             for (int i = 0; i < MAX_CONNS; i++) {
                 if (connections[i] && connections[i] != conn) {
                     primary_idx = i;
-                    printk(">>> Primary yielded to conn[%d]\n", i);
+                    APP_TRACE(">>> Primary yielded to conn[%d]\n", i);
                     found = true;
                     break;
                 }
@@ -3730,11 +3818,11 @@ static ssize_t audio_rx_write(struct bt_conn *conn, const struct bt_gatt_attr *a
                 int self = conn_index(conn);
                 if (self >= 0) {
                     primary_idx = self;
-                    printk(">>> Primary yield ignored (no peer); conn[%d] stays primary\n",
+                    APP_TRACE(">>> Primary yield ignored (no peer); conn[%d] stays primary\n",
                            self);
                 } else {
                     primary_idx = -1;
-                    printk(">>> Primary yielded but no peer present; primary cleared\n");
+                    APP_TRACE(">>> Primary yielded but no peer present; primary cleared\n");
                 }
             }
             /* Update connection params after yield */
@@ -3743,7 +3831,7 @@ static ssize_t audio_rx_write(struct bt_conn *conn, const struct bt_gatt_attr *a
             if (data[1] == OPERATION_MODE_NORMAL ||
                 data[1] == OPERATION_MODE_DRIVING) {
                 operation_mode_pending = data[1];
-                printk(">>> Operation mode request: %s%s\n",
+                APP_TRACE(">>> Operation mode request: %s%s\n",
                        data[1] == OPERATION_MODE_DRIVING ? "DRIVING" : "NORMAL",
                        (is_recording || recording_requested) ? " (pending)" : "");
                 /* Ack on accept too. While recording, apply_pending_operation_mode()
@@ -3751,22 +3839,9 @@ static ssize_t audio_rx_write(struct bt_conn *conn, const struct bt_gatt_attr *a
                  * could never observe a non-none pending. */
                 send_operation_mode_status();
             } else {
-                printk(">>> Invalid operation mode: %u\n", data[1]);
+                APP_TRACE(">>> Invalid operation mode: %u\n", data[1]);
                 send_operation_mode_status();
             }
-        } else if (data[0] == CMD_SET_GESTURE_CAPTURE && len >= 2) {
-#if GESTURE_DEBUG_HISTORY
-            gesture_capture_enabled = (data[1] != 0);
-            if (!gesture_capture_enabled) {
-                /* Drop a sequence already being recorded rather than flushing
-                 * a half window the host did not ask for. */
-                gesture_trajectory_discard();
-                gesture_history_clear();
-            }
-#endif
-            printk(">>> Gesture capture: %s\n",
-                   gesture_capture_effective() ? "ON" : "OFF");
-            send_gesture_capture_status();
         } else if (data[0] == CMD_SET_GESTURE_DETECT && len >= 2) {
             gesture_detect_enabled = (data[1] != 0);
             if (!gesture_detect_enabled &&
@@ -3781,59 +3856,41 @@ static ssize_t audio_rx_write(struct bt_conn *conn, const struct bt_gatt_attr *a
                 reset_gesture_sequence();
                 gesture_rearm_required = true;
             }
-            printk(">>> Gesture detect: %s\n",
+            APP_TRACE(">>> Gesture detect: %s\n",
                    gesture_detect_effective() ? "ON" : "OFF");
             send_gesture_detect_status();
-        } else if ((data[0] == 0x53 || data[0] == 0x54) && len >= 2) {
-            struct tap_debug_command cmd = {.command = data[0], .op = data[1]};
-            if (cmd.op > 2) return len;
-            if (cmd.command == 0x53 && cmd.op != 0) {
-                if (len != 4) return len;
-                cmd.arg = sys_get_le16(data + 2);
+        } else if (data[0] == 0x55 || data[0] == 0x52 || data[0] == 0x53 ||
+                   data[0] == 0x54 || data[0] == CMD_IMU_REG_WRITE ||
+                   data[0] == CMD_IMU_REG_READ || data[0] == CMD_SET_GESTURE_CAPTURE ||
+                   data[0] == 0x04) {
+            struct tap_debug_command cmd = {.command = data[0], .op = len > 1 ? data[1] : 0};
+            bool valid = len == 2;
+            if (cmd.command == 0x04) valid = len == 1;
+            else if (cmd.command == CMD_IMU_REG_WRITE) {
+                valid = len == 3;
+                if (valid) cmd.arg = data[2];
+            } else if (cmd.command == 0x53 && cmd.op != 0) {
+                valid = len == 4 && cmd.op <= 2;
+                if (valid) cmd.arg = sys_get_le16(data + 2);
             } else if (cmd.command == 0x54 && cmd.op == 1) {
-                if (len != 42) return len;
-                uint8_t wire[40]; memcpy(wire, data + 2, 40);
-                tap_config_wire(&cmd.config, wire, true);
+                valid = len == 42;
+                if (valid) { uint8_t wire[40]; memcpy(wire, data + 2, 40);
+                             tap_config_wire(&cmd.config, wire, true); }
+            } else if (cmd.command == 0x55 || cmd.command == 0x54) valid &= cmd.op <= 2;
+            else if (cmd.command == 0x52 || cmd.command == CMD_SET_GESTURE_CAPTURE) valid &= cmd.op <= 1;
+            if (!valid) return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+            cmd.conn = bt_conn_ref(conn);
+            if (k_msgq_put(&tap_debug_queue, &cmd, K_NO_WAIT)) {
+                bt_conn_unref(cmd.conn);
+                return BT_GATT_ERR(BT_ATT_ERR_INSUFFICIENT_RESOURCES);
             }
-            (void)k_msgq_put(&tap_debug_queue, &cmd, K_NO_WAIT);
-        } else if (data[0] == 0x52 && len >= 2 && data[1] <= 1) {
-            /* 0=read, 1=clear counters then read; classifier is unchanged. */
-            atomic_set(&tap_stats_request, data[1] ? 2 : 1);
-        } else if (data[0] == CMD_IMU_REG_WRITE && len >= 3) {
-            uint8_t reg = data[1];
-            uint8_t val = data[2];
-            uint8_t readback = 0;
-            int ret;
-
-            if (!tap_reg_writable(reg)) {
-                printk(">>> IMU reg write rejected: 0x%02x\n", reg);
-                send_tap_reg_ack(reg, 0, -EPERM);
-            } else {
-                ret = i2c_reg_write_byte_dt(&imu_i2c, reg, val);
-                if (ret == 0) {
-                    ret = i2c_reg_read_byte_dt(&imu_i2c, reg, &readback);
-                }
-                send_tap_reg_ack(reg, readback, ret);
-            }
-        } else if (data[0] == CMD_IMU_REG_READ && len >= 2) {
-            uint8_t reg = data[1];
-            uint8_t val = 0;
-            int ret = i2c_reg_read_byte_dt(&imu_i2c, reg, &val);
-
-            send_tap_reg_ack(reg, val, ret);
-#if GESTURE_DEBUG_HISTORY
-        } else if (data[0] == 0x04) {
-            if (!gesture_host_collection_start()) {
-                printk(">>> Host IMU collection rejected: busy\n");
-            }
-#endif
         } else if (data[0] == CMD_REBOOT_BOOTLOADER && len >= 3 &&
                    data[1] == REBOOT_MAGIC_1 && data[2] == REBOOT_MAGIC_2) {
             bool accepted = !(is_recording || recording_requested);
             uint8_t ack[5] = { 0x00, 0x55, EVT_REBOOT_ACK, 1,
                                accepted ? 1 : 0 };
 
-            printk(">>> Reboot to bootloader requested: %s\n",
+            APP_TRACE(">>> Reboot to bootloader requested: %s\n",
                    accepted ? "accepted" : "REFUSED (recording)");
             notify_one(conn, ack, sizeof(ack));
 
@@ -3877,7 +3934,7 @@ static void send_operation_mode_status(void)
 static bool gesture_capture_effective(void)
 {
 #if GESTURE_DEBUG_HISTORY
-    return gesture_capture_enabled;
+    return atomic_get(&debug_active) && gesture_capture_enabled;
 #else
     return false;
 #endif
@@ -3987,7 +4044,7 @@ static void notify_all_conns(const void *data, uint16_t len)
         }
     }
     if (n == 0) {
-        printk(">>> notify_all: no active conn\n");
+        APP_TRACE(">>> notify_all: no active conn\n");
     }
 }
 
@@ -3999,17 +4056,17 @@ static void send_event_packet(uint8_t event_code)
     /* Tap events are diagnostic / control UI signals for every host. */
     if (event_code == EVT_DOUBLE_TAP || event_code == EVT_SINGLE_TAP ||
         event_code == 0x20 || event_code == 0x21) {
-        printk(">>> send_event 0x%02x -> all conns (primary[%d])\n",
+        APP_TRACE(">>> send_event 0x%02x -> all conns (primary[%d])\n",
                event_code, primary_idx);
         notify_all_conns(pkt, sizeof(pkt));
         return;
     }
 
     if (!get_primary_conn()) {
-        printk(">>> send_event 0x%02x: no primary conn\n", event_code);
+        APP_TRACE(">>> send_event 0x%02x: no primary conn\n", event_code);
         return;
     }
-    printk(">>> send_event 0x%02x -> primary[%d]\n", event_code, primary_idx);
+    APP_TRACE(">>> send_event 0x%02x -> primary[%d]\n", event_code, primary_idx);
     notify_one(get_primary_conn(), pkt, sizeof(pkt));
 }
 
@@ -4047,7 +4104,7 @@ static void send_tap_reg_ack(uint8_t reg, uint8_t value, int ret)
     uint8_t pkt[6] = { 0x00, 0x55, EVT_TAP_REG_ACK, reg, value,
                        (uint8_t)(int8_t)ret };
 
-    printk(">>> IMU reg 0x%02x = 0x%02x (ret=%d)\n", reg, value, ret);
+    APP_TRACE(">>> IMU reg 0x%02x = 0x%02x (ret=%d)\n", reg, value, ret);
     notify_all_conns(pkt, sizeof(pkt));
 }
 
@@ -4072,7 +4129,7 @@ static void send_boot_report(struct bt_conn *conn)
     sys_put_le16(boot_crash_ndrop, &pkt[13]);
 
     notify_one(conn, pkt, sizeof(pkt));
-    printk(">>> boot_report cause=0x%08x crash=%u stage=%u(%s) prev_up=%us hb=%u ndrop=%u\n",
+    APP_TRACE(">>> boot_report cause=0x%08x crash=%u stage=%u(%s) prev_up=%us hb=%u ndrop=%u\n",
            boot_reset_cause, boot_crash_valid, boot_crash_stage,
            stage_str(boot_crash_stage), boot_crash_up_s, boot_crash_hb,
            boot_crash_ndrop);
@@ -4107,12 +4164,12 @@ static void send_pending_greetings(void)
         uint8_t det[4] = {0x00, 0x55, EVT_GESTURE_DETECT,
                           gesture_detect_effective() ? 1 : 0};
         notify_one(connections[i], det, sizeof(det));
-        printk(">>> Greeted conn[%d]: mode=%u capture=%u detect=%u\n", i,
+        APP_TRACE(">>> Greeted conn[%d]: mode=%u capture=%u detect=%u\n", i,
                operation_mode, cap[3], det[3]);
 
         /* send_tap_diag() notifies every client; an extra copy for an already
          * connected peer is harmless and keeps the I2C reads in one place. */
-        tap_diag_once_pending = true;
+        tap_diag_once_pending = atomic_get(&debug_active);
     }
 }
 
@@ -4135,6 +4192,7 @@ static void send_event_packet_xyz(uint8_t event_code, float x, float y, float z)
 static void send_gesture_diag(uint8_t stage, uint8_t reason,
                               float value1, float value2, float value3)
 {
+    if (!atomic_get(&debug_active)) return;
 #if GESTURE_DEBUG_HISTORY
     /* Always buffer milestones/rejects for end-of-session dump. */
     if (stage != GESTURE_DIAG_FINAL_SAMPLE) {
@@ -4163,7 +4221,7 @@ static void flush_gesture_history(void)
     uint8_t session;
     uint8_t count;
 
-    if (!conn || gesture_history_count == 0) {
+    if (!atomic_get(&debug_active) || !conn || gesture_history_count == 0) {
         gesture_history_flush_pending = false;
         return;
     }
@@ -4183,7 +4241,7 @@ static void flush_gesture_history(void)
     notify_one(conn, pkt, 5);
     k_msleep(GESTURE_HISTORY_FLUSH_GAP_MS);
 
-    for (i = 0; i < count; i++) {
+    for (i = 0; i < count && atomic_get(&debug_active); i++) {
         const gesture_history_entry_t *e = &gesture_history[i];
         /* [00 55 34][u16 t_ms LE][stage][reason][f32×3] = 19 bytes */
         pkt[0] = 0x00;
@@ -4198,7 +4256,7 @@ static void flush_gesture_history(void)
         if (notify_one(conn, pkt, 19) == -EAGAIN) {
             /* Peer is backed up. Truncate rather than spend
              * CTRL_NOTIFY_WAIT_MS per remaining entry in the main loop. */
-            printk(">>> Gesture history truncated at %u/%u\n", i, count);
+            APP_TRACE(">>> Gesture history truncated at %u/%u\n", i, count);
             break;
         }
         k_msleep(GESTURE_HISTORY_FLUSH_GAP_MS);
@@ -4209,11 +4267,11 @@ static void flush_gesture_history(void)
     pkt[2] = EVT_GESTURE_HISTORY_END;
     pkt[3] = count;
     pkt[4] = session;
-    notify_one(conn, pkt, 5);
+    if (atomic_get(&debug_active)) notify_one(conn, pkt, 5);
 
     gesture_history_count = 0;
     gesture_history_flush_pending = false;
-    printk(">>> Gesture history flushed session=%u count=%u\n",
+    APP_TRACE(">>> Gesture history flushed session=%u count=%u\n",
            session, count);
 }
 #else
@@ -4243,15 +4301,15 @@ static bool flush_trajectory_batch(const gesture_trajectory_sample_t *samples,
     uint8_t session;
     bool notify_error = false;
 
-    if (sample_count == 0) {
+    if (!atomic_get(&debug_active) || sample_count == 0) {
         return true;
     }
     if (!atomic_cas(&trajectory_flush_busy, 0, 1)) {
-        printk(">>> %s skipped: a batch is already in flight\n", label);
+        APP_TRACE(">>> %s skipped: a batch is already in flight\n", label);
         return false;
     }
     if (!conn) {
-        printk(">>> %s discarded: no primary connection\n", label);
+        APP_TRACE(">>> %s discarded: no primary connection\n", label);
         atomic_set(&trajectory_flush_busy, 0);
         return false;
     }
@@ -4279,7 +4337,7 @@ static bool flush_trajectory_batch(const gesture_trajectory_sample_t *samples,
     }
     k_msleep(GESTURE_HISTORY_FLUSH_GAP_MS);
 
-    while (start < sample_count) {
+    while (start < sample_count && atomic_get(&debug_active)) {
         uint8_t count = (uint8_t)MIN(
             GESTURE_TRAJECTORY_CHUNK_SAMPLES,
             sample_count - start);
@@ -4327,9 +4385,9 @@ static bool flush_trajectory_batch(const gesture_trajectory_sample_t *samples,
     memcpy(&pkt[4], &sent, 2);
     pkt[6] = (overflow ? BIT(0) : 0) |
              (notify_error ? BIT(1) : 0);
-    (void)notify_one(conn, pkt, 7);
+    if (atomic_get(&debug_active)) (void)notify_one(conn, pkt, 7);
     atomic_set(&trajectory_flush_busy, 0);
-    printk(">>> %s flushed session=%u count=%u sent=%u flags=0x%02x\n",
+    APP_TRACE(">>> %s flushed session=%u count=%u sent=%u flags=0x%02x\n",
            label, session, sample_count, sent, pkt[6]);
     return true;
 }
@@ -4417,7 +4475,8 @@ static void audio_stats_print(const char *reason)
         dmic_ms = session_ms;
     }
 
-    printk("Audio stats (%s): sess=%lldms dmic=%lldms cap=%u sent=%u bytes=%u "
+    if (!atomic_get(&debug_active)) return;
+    APP_TRACE("Audio stats (%s): sess=%lldms dmic=%lldms cap=%u sent=%u bytes=%u "
            "ntfy=%u wait=%u wait_max=%ums retry=%u read_err=%u last_err=%d "
            "overrun=%u q_hi=%u\n",
            reason,
@@ -4558,7 +4617,7 @@ static bool drain_audio_notifications(void)
     }
 
     if (acquired != AUDIO_NOTIFY_IN_FLIGHT) {
-        printk("Audio notify drain timed out: %d/%d slots returned\n",
+        APP_TRACE("Audio notify drain timed out: %d/%d slots returned\n",
                acquired, AUDIO_NOTIFY_IN_FLIGHT);
         return false;
     }
@@ -4621,7 +4680,7 @@ static int stream_queued_frames(bool blocking)
 
         int ret = stream_audio_frame(frame.pcm, frame.nbytes);
         if (ret < 0 && ret != -ECANCELED && ret != -ENOTCONN) {
-            printk("Audio notify failed: %d\n", ret);
+            APP_TRACE("Audio notify failed: %d\n", ret);
             k_msleep(AUDIO_NOTIFY_RETRY_MS);
         } else if (ret == -ENOTCONN || ret == -ECANCELED) {
             return ret;
@@ -4670,12 +4729,12 @@ static void audio_capture_thread(void *p1, void *p2, void *p3)
 
     int consec_fail = 0;
 
-    printk("Audio capture thread started\n");
+    APP_TRACE("Audio capture thread started\n");
 
     while (1) {
         if (!capture_enabled) {
             consec_fail = 0;
-            k_msleep(5);
+            k_sem_take(&audio_capture_wake, K_FOREVER);
             continue;
         }
 
@@ -4693,14 +4752,15 @@ static void audio_capture_thread(void *p1, void *p2, void *p3)
              * draining whatever was already queued.
              */
             if (consec_fail >= AUDIO_CAPTURE_MAX_CONSEC_FAIL) {
-                printk("Audio read failed: %d (giving up after %d errors)\n",
+                LOG_WRN("Audio read failed: %d (giving up after %d errors)\n",
                        ret, consec_fail);
                 if (audio_stats.dmic_stop_ms == 0) {
                     audio_stats.dmic_stop_ms = k_uptime_get();
                 }
-                capture_fatal = true;
                 capture_enabled = false;
                 (void)audio_capture_stop();
+                capture_fatal = true;
+                k_sem_give(&audio_control_wake);
                 consec_fail = 0;
             }
             continue;
@@ -4739,14 +4799,14 @@ static void audio_thread(void *p1, void *p2, void *p3)
     bool dmic_available = false;
     bool dmic_session_active = false;
 
-    printk("Audio thread started\n");
+    APP_TRACE("Audio thread started\n");
 
     ret = audio_capture_init();
     if (ret < 0) {
-        printk("Audio init failed: %d — audio disabled\n", ret);
+        LOG_WRN("Audio init failed: %d — audio disabled\n", ret);
     } else {
         dmic_available = true;
-        printk("Audio capture initialized\n");
+        APP_TRACE("Audio capture initialized\n");
     }
 
     while (1) {
@@ -4762,21 +4822,22 @@ static void audio_thread(void *p1, void *p2, void *p3)
                 mic_power_on();
                 ret = audio_capture_start();
                 if (ret < 0) {
-                    printk("Audio start failed: %d\n", ret);
+                    LOG_WRN("Audio start failed: %d\n", ret);
                     mic_power_off();
                     dmic_session_active = false;
                     capture_enabled = false;
                 } else {
                     dmic_session_active = true;
                     capture_enabled = true;
-                    printk("Audio capture running\n");
+                    k_sem_give(&audio_capture_wake);
+                    APP_TRACE("Audio capture running\n");
                 }
             }
 
             is_recording = true;
             gyro_set_enabled(true);
             sync_primary_conn_speed();
-            printk("Recording started\n");
+            APP_TRACE("Recording started\n");
             send_event_packet(0x01);
         }
 
@@ -4793,7 +4854,7 @@ static void audio_thread(void *p1, void *p2, void *p3)
                 }
                 ret = audio_capture_stop();
                 if (ret < 0) {
-                    printk("Audio stop failed: %d\n", ret);
+                    LOG_WRN("Audio stop failed: %d\n", ret);
                 }
                 mic_power_off();
                 dmic_session_active = false;
@@ -4812,7 +4873,7 @@ static void audio_thread(void *p1, void *p2, void *p3)
 
             /* Preserve ordering: all accepted PCM notifications must complete before stop. */
             (void)drain_audio_notifications();
-            printk("Recording stopped%s\n", was_fatal ? " (capture fault)" : "");
+            APP_TRACE("Recording stopped%s\n", was_fatal ? " (capture fault)" : "");
             audio_stats_print(was_fatal ? "fault" : "stop");
             send_event_packet(0x02);
             flush_host_collection();
@@ -4844,7 +4905,7 @@ static void audio_thread(void *p1, void *p2, void *p3)
                 reset_recording_stop_state();
                 gyro_set_enabled(false);
                 (void)drain_audio_notifications();
-                printk("Recording stopped (disconnected)\n");
+                APP_TRACE("Recording stopped (disconnected)\n");
                 audio_stats_print("disconnect");
                 send_event_packet(0x02);
                 flush_host_collection();
@@ -4853,7 +4914,7 @@ static void audio_thread(void *p1, void *p2, void *p3)
             }
         }
 
-        k_msleep(20);
+        k_sem_take(&audio_control_wake, K_FOREVER);
     }
 }
 
@@ -4865,9 +4926,9 @@ static void exchange_func(struct bt_conn *conn, uint8_t att_err,
                           struct bt_gatt_exchange_params *params)
 {
     if (att_err) {
-        printk(">>> MTU exchange failed: %d\n", att_err);
+        LOG_WRN(">>> MTU exchange failed: %d\n", att_err);
     } else {
-        printk(">>> MTU exchange done\n");
+        APP_TRACE(">>> MTU exchange done\n");
     }
 }
 
@@ -4938,7 +4999,7 @@ static void adv_work_handler(struct k_work *work)
 
     if (want == ADV_TIER_OFF) {
         adv_tier = want;
-        printk(">>> Adv off (conns=%d)\n", n);
+        APP_TRACE(">>> Adv off (conns=%d)\n", n);
         return;
     }
 
@@ -4954,13 +5015,13 @@ static void adv_work_handler(struct k_work *work)
                           scan_rsp, ARRAY_SIZE(scan_rsp));
     if (ret) {
         LOG_WRN("Advertising start failed: %d", ret);
-        printk(">>> Adv start failed: %d\n", ret);
+        LOG_WRN(">>> Adv start failed: %d\n", ret);
         adv_tier = ADV_TIER_UNKNOWN;
         k_work_schedule(&adv_work, K_MSEC(500));
         return;
     }
     adv_tier = want;
-    printk(">>> Adv tier=%s conns=%d\n", label, n);
+    APP_TRACE(">>> Adv tier=%s conns=%d\n", label, n);
 }
 
 /* ============================================================================
@@ -4970,42 +5031,59 @@ static void adv_work_handler(struct k_work *work)
  *   'b' → reboot into the UF2 bootloader (same path as RX 0x60)
  * ============================================================================ */
 
+static void serial_rx_ready(const struct device *dev, void *user_data)
+{
+    ARG_UNUSED(user_data);
+    while (uart_irq_update(dev) && uart_irq_rx_ready(dev)) {
+        uint8_t bytes[16];
+        int count = uart_fifo_read(dev, bytes, sizeof(bytes));
+        if (count <= 0) break;
+        for (int i = 0; i < count; i++) {
+            (void)k_msgq_put(&serial_rx_q, &bytes[i], K_NO_WAIT);
+        }
+    }
+}
+
 static void serial_cmd_thread(void *p1, void *p2, void *p3)
 {
     ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
 
     const struct device *uart_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
     if (!device_is_ready(uart_dev)) {
-        printk(">>> Serial: console UART not ready\n");
+        APP_TRACE(">>> Serial: console UART not ready\n");
         return;
     }
 
-    printk(">>> Serial command thread ready ('r'=start 's'=stop 'b'=bootloader)\n");
+    if (uart_irq_callback_user_data_set(uart_dev, serial_rx_ready, NULL)) {
+        LOG_ERR("Serial RX interrupt setup failed");
+        return;
+    }
+    uart_irq_rx_enable(uart_dev);
+    APP_TRACE(">>> Serial command thread ready ('r'=start 's'=stop 'b'=bootloader)\n");
 
     while (true) {
         unsigned char ch;
-        int ret = uart_poll_in(uart_dev, &ch);
-        if (ret == 0) {
+        if (!k_msgq_get(&serial_rx_q, &ch, K_FOREVER)) {
             if (ch == 'r' || ch == 'R') {
-                printk(">>> SERIAL: recording start\n");
+                APP_TRACE(">>> SERIAL: recording start\n");
                 stop_requested = false;
                 recording_requested = true;
+                k_sem_give(&audio_control_wake);
             } else if (ch == 's' || ch == 'S') {
-                printk(">>> SERIAL: recording stop\n");
+                APP_TRACE(">>> SERIAL: recording stop\n");
                 stop_requested = true;
+                k_sem_give(&audio_control_wake);
             } else if (ch == 'b' || ch == 'B') {
                 if (is_recording || recording_requested) {
-                    printk(">>> SERIAL: bootloader REFUSED (recording)\n");
+                    APP_TRACE(">>> SERIAL: bootloader REFUSED (recording)\n");
                 } else {
-                    printk(">>> SERIAL: reboot to bootloader\n");
+                    APP_TRACE(">>> SERIAL: reboot to bootloader\n");
                     /* Via the work item rather than inline so both entry points
                      * take the same path, and so this thread's printk can drain
                      * before the reset. */
                     k_work_schedule(&reboot_work, K_MSEC(500));
                 }
             }
-        } else {
-            k_msleep(20);
         }
     }
 }
@@ -5033,8 +5111,8 @@ static void ble_connected(struct bt_conn *conn, uint8_t err)
 {
     if (err) { LOG_ERR("BLE connection failed: %d", err); return; }
 
-    LOG_INF("BLE connected");
-    printk(">>> Connected!\n");
+    APP_INFO("BLE connected");
+    APP_TRACE(">>> Connected!\n");
 
     int slot = free_slot();
     if (slot < 0) {
@@ -5051,9 +5129,9 @@ static void ble_connected(struct bt_conn *conn, uint8_t err)
 
     if (primary_idx < 0) {
         primary_idx = slot;
-        printk(">>> conn[%d] is primary\n", slot);
+        APP_TRACE(">>> conn[%d] is primary\n", slot);
     } else {
-        printk(">>> conn[%d] is secondary, notifying primary\n", slot);
+        APP_TRACE(">>> conn[%d] is secondary, notifying primary\n", slot);
         uint8_t pkt[3] = { 0x00, 0x55, 0x31 };
         notify_one(get_primary_conn(), pkt, sizeof(pkt));
     }
@@ -5068,7 +5146,7 @@ static void ble_connected(struct bt_conn *conn, uint8_t err)
     exchange_params[slot].func = exchange_func;
     int ret = bt_gatt_exchange_mtu(conn, &exchange_params[slot]);
     if (ret) {
-        printk(">>> MTU exchange request failed: %d\n", ret);
+        LOG_WRN(">>> MTU exchange request failed: %d\n", ret);
     }
 
     /* Idle primary stays at 30–50 ms until recording needs the fast
@@ -5079,7 +5157,7 @@ static void ble_connected(struct bt_conn *conn, uint8_t err)
         /* Schedule advertising restart via work queue — calling bt_le_adv_start()
          * directly from within a BT callback can fail on Nordic NCS. */
         k_work_schedule(&adv_work, K_MSEC(100));
-        printk(">>> Advertising restart scheduled\n");
+        APP_TRACE(">>> Advertising restart scheduled\n");
     }
 }
 
@@ -5088,10 +5166,10 @@ static void ble_disconnected(struct bt_conn *conn, uint8_t reason)
     int64_t now = k_uptime_get();
     int idx = conn_index(conn);
 
-    LOG_INF("BLE disconnected: %d", reason);
+    APP_INFO("BLE disconnected: %d", reason);
 
     if (idx < 0) {
-        printk(">>> DISCONN (unknown slot) reason=0x%02x %s\n",
+        APP_TRACE(">>> DISCONN (unknown slot) reason=0x%02x %s\n",
                reason, hci_reason_str(reason));
         return;
     }
@@ -5103,7 +5181,7 @@ static void ble_disconnected(struct bt_conn *conn, uint8_t reason)
      *   params  - what the link was actually running at, or never-updated,
      *             which would mean the peer ignored every parameter request
      *   ndrop   - control notifies dropped because the peer stopped ACKing */
-    printk(">>> DISCONN idx=%d reason=0x%02x %s up=%llds age=%llds "
+    APP_TRACE(">>> DISCONN idx=%d reason=0x%02x %s up=%llds age=%llds "
            "params=%u/%u/%u(%s) since_rec=%llds ndrop=%u\n",
            idx, reason, hci_reason_str(reason),
            now / 1000, (now - conn_started_ms[idx]) / 1000,
@@ -5124,13 +5202,14 @@ static void ble_disconnected(struct bt_conn *conn, uint8_t reason)
         for (int i = 0; i < MAX_CONNS; i++) {
             if (connections[i]) {
                 primary_idx = i;
-                printk(">>> conn[%d] promoted to primary\n", i);
+                APP_TRACE(">>> conn[%d] promoted to primary\n", i);
                 break;
             }
         }
         if (primary_idx < 0) {
             is_recording = false;
             stop_requested = true;
+            k_sem_give(&audio_control_wake);
             reset_recording_stop_state();
             gyro_set_enabled(false);
             /* Latch is global, not per-conn: clear it so the next connection
@@ -5138,7 +5217,7 @@ static void ble_disconnected(struct bt_conn *conn, uint8_t reason)
             ble_primary_want_fast = false;
         }
     } else if (primary_idx >= 0) {
-        printk(">>> Secondary disconnected, notifying primary\n");
+        APP_TRACE(">>> Secondary disconnected, notifying primary\n");
         uint8_t pkt[3] = { 0x00, 0x55, 0x32 };
         notify_one(get_primary_conn(), pkt, sizeof(pkt));
     }
@@ -5147,7 +5226,7 @@ static void ble_disconnected(struct bt_conn *conn, uint8_t reason)
 
     /* Schedule advertising restart via work queue */
     k_work_schedule(&adv_work, K_MSEC(100));
-    printk(">>> Advertising restart scheduled\n");
+    APP_TRACE(">>> Advertising restart scheduled\n");
 }
 
 static void ble_le_param_updated(struct bt_conn *conn, uint16_t interval,
@@ -5162,7 +5241,7 @@ static void ble_le_param_updated(struct bt_conn *conn, uint16_t interval,
         conn_param_seen[idx]     = true;
     }
 
-    printk(">>> le_param_updated[%d]: interval=%u (%u.%02u ms) latency=%u timeout=%u (%u ms)\n",
+    APP_TRACE(">>> le_param_updated[%d]: interval=%u (%u.%02u ms) latency=%u timeout=%u (%u ms)\n",
            idx, interval, (interval * 125U) / 100U, (interval * 125U) % 100U,
            latency, timeout, timeout * 10U);
 }
@@ -5190,9 +5269,9 @@ static void enter_systemoff_for_tap_wake(void)
     uint8_t tap_src = 0;
     int ret;
 
-    printk(">>> SYSTEMOFF: %u min unconnected (had_conn=%d), tap to wake\n",
+    APP_TRACE(">>> SYSTEMOFF: %u min unconnected (had_conn=%d), tap to wake\n",
            (unsigned)(systemoff_fuse_ms() / 60000U), (int)had_conn_this_cycle);
-    LOG_INF("Entering SYSTEMOFF; tap to resume advertising");
+    APP_INFO("Entering SYSTEMOFF; tap to resume advertising");
 
     rgb_set(false, false, false);
     adv_tier = ADV_TIER_UNKNOWN;
@@ -5204,7 +5283,7 @@ static void enter_systemoff_for_tap_wake(void)
     (void)bt_le_adv_stop();
 
     if (!device_is_ready(imu) || !i2c_is_ready_dt(&imu_i2c)) {
-        printk(">>> SYSTEMOFF aborted: IMU not ready\n");
+        LOG_WRN(">>> SYSTEMOFF aborted: IMU not ready\n");
         adv_tier = ADV_TIER_UNKNOWN;
         k_work_schedule(&adv_work, K_MSEC(100));
         unconnected_since_ms = k_uptime_get();
@@ -5213,13 +5292,13 @@ static void enter_systemoff_for_tap_wake(void)
 
     ret = configure_tap_wake();
     if (ret < 0) {
-        printk(">>> SYSTEMOFF aborted: MD1_CFG %d\n", ret);
+        LOG_WRN(">>> SYSTEMOFF aborted: MD1_CFG %d\n", ret);
         goto restore_adv;
     }
 
     ret = i2c_reg_read_byte_dt(&imu_i2c, LSM6DS3TR_C_REG_TAP_SRC, &tap_src);
     if (ret < 0) {
-        printk(">>> SYSTEMOFF aborted: TAP_SRC %d\n", ret);
+        LOG_WRN(">>> SYSTEMOFF aborted: TAP_SRC %d\n", ret);
         goto restore_adv;
     }
 
@@ -5229,13 +5308,13 @@ static void enter_systemoff_for_tap_wake(void)
         k_msleep(10);
     }
     if (gpio_pin_get_dt(&imu_int1) > 0) {
-        printk(">>> SYSTEMOFF aborted: INT1 high (TAP_SRC=0x%02x)\n", tap_src);
+        LOG_WRN(">>> SYSTEMOFF aborted: INT1 high (TAP_SRC=0x%02x)\n", tap_src);
         goto restore_adv;
     }
 
     ret = gpio_pin_interrupt_configure_dt(&imu_int1, GPIO_INT_LEVEL_ACTIVE);
     if (ret < 0) {
-        printk(">>> SYSTEMOFF aborted: INT1 sense %d\n", ret);
+        LOG_WRN(">>> SYSTEMOFF aborted: INT1 sense %d\n", ret);
         goto restore_adv;
     }
 
@@ -5270,7 +5349,7 @@ static void reboot_work_handler(struct k_work *work)
 {
     ARG_UNUSED(work);
 
-    printk(">>> Rebooting into UF2 bootloader (GPREGRET=0x%02x)\n",
+    APP_TRACE(">>> Rebooting into UF2 bootloader (GPREGRET=0x%02x)\n",
            BOOTLOADER_MAGIC_UF2);
 
     if (wdt_channel_id >= 0) {
@@ -5293,11 +5372,11 @@ int main(void)
     usb_enable(NULL);
     k_msleep(500);
 
-    printk("\n");
-    printk("============================================\n");
-    printk("nordic-main: XIAO nRF52840 Sense\n");
-    printk("Build: %s %s\n", __DATE__, __TIME__);
-    printk("============================================\n\n");
+    APP_TRACE("\n");
+    APP_TRACE("============================================\n");
+    APP_TRACE("nordic-main: XIAO nRF52840 Sense\n");
+    APP_TRACE("Build: %s %s\n", __DATE__, __TIME__);
+    APP_TRACE("============================================\n\n");
 
     log_reset_cause();
 
@@ -5309,7 +5388,7 @@ int main(void)
      * Every wait in the boot path below must therefore feed it. */
     configure_watchdog();
 
-    LOG_INF("Starting nordic-main");
+    APP_INFO("Starting nordic-main");
 
     ret = configure_leds();
     if (ret < 0) LOG_WRN("LED setup failed: %d", ret);
@@ -5351,7 +5430,7 @@ int main(void)
     adv_tier = ADV_TIER_FAST;
     adv_note_conn_change();
 
-    LOG_INF("BLE advertising: %s", BLE_DEVICE_NAME);
+    APP_INFO("BLE advertising: %s", BLE_DEVICE_NAME);
 
     /* Capture runs above sender so DMIC blocks are freed under BLE backpressure. */
     k_thread_create(&audio_capture_thread_data, audio_capture_stack,
@@ -5365,7 +5444,7 @@ int main(void)
     k_thread_create(&serial_thread_data, serial_stack, K_THREAD_STACK_SIZEOF(serial_stack),
                     serial_cmd_thread, NULL, NULL, NULL, 10, 0, K_NO_WAIT);
 
-    LOG_INF("nordic-main ready");
+    APP_INFO("nordic-main ready");
 
     /* Boot LED: white for ~1 second, then advertising blink or idle */
     {
@@ -5397,10 +5476,9 @@ int main(void)
         int img_ret = boot_write_img_confirmed();
         if (img_ret < 0) {
             LOG_WRN("Image confirm failed: %d", img_ret);
-            printk("Image confirm failed: %d\n", img_ret);
         } else {
-            LOG_INF("Image confirmed");
-            printk("Image confirmed (permanent)\n");
+            APP_INFO("Image confirmed");
+            APP_TRACE("Image confirmed (permanent)\n");
         }
     }
 
@@ -5430,7 +5508,7 @@ int main(void)
          * never hit: it is the only thing feeding the watchdog. */
         if (last_pass_ms &&
             (now_ms - last_pass_ms) > MAIN_LOOP_STALL_WARN_MS) {
-            printk(">>> STALL %lld ms at stage=%u(%s) conns=%d ndrop=%u\n",
+            LOG_WRN(">>> STALL %lld ms at stage=%u(%s) conns=%d ndrop=%u\n",
                    now_ms - last_pass_ms, cb.stage, stage_str(cb.stage),
                    active_count(), ctrl_notify_dropped);
         }
@@ -5441,6 +5519,7 @@ int main(void)
         cb.ndrop = ctrl_notify_dropped;
         loop_stage(STAGE_IDLE);
 
+        process_tap_debug_command();
         apply_pending_operation_mode();
 
         /* IMU motion detection — poll faster when active, slower when sleeping */
@@ -5454,7 +5533,6 @@ int main(void)
             process_motion_sample();
         }
         loop_stage(STAGE_TAP);
-        process_tap_debug_command();
         process_tap_event(now_ms);
         process_tap_stats_request();
 
@@ -5464,7 +5542,7 @@ int main(void)
         if (tap_diag_once_pending) {
             tap_diag_once_pending = false;
             loop_stage(STAGE_TAPDIAG);
-            send_tap_diag();
+            if (atomic_get(&debug_active)) send_tap_diag();
         }
         loop_stage(STAGE_IDLE);
 
@@ -5479,7 +5557,7 @@ int main(void)
                 loop_stage(STAGE_SLEEPNFY);
                 send_event_packet(0x20);
                 loop_stage(STAGE_IDLE);
-                printk(">>> Light sleep enter\n");
+                APP_TRACE(">>> Light sleep enter\n");
             }
         } else {
             if (light_sleep_active) {
@@ -5487,7 +5565,7 @@ int main(void)
                 loop_stage(STAGE_SLEEPNFY);
                 send_event_packet(0x21);
                 loop_stage(STAGE_IDLE);
-                printk(">>> Light sleep wake\n");
+                APP_TRACE(">>> Light sleep wake\n");
             }
             last_activity_ms = now_ms;
         }
@@ -5519,21 +5597,21 @@ int main(void)
             (now_ms - last_heartbeat_ms) >= HEARTBEAT_INTERVAL_MS) {
             last_heartbeat_ms = now_ms;
             cb.hb_seq = ++hb_seq;
-            printk(">>> HB #%u up=%llds conns=%d rec=%d slp=%d bat=%u%% "
+            APP_TRACE(">>> HB #%u up=%llds conns=%d rec=%d slp=%d bat=%u%% "
                    "ndrop=%u adv=%d",
                    hb_seq, now_ms / 1000, active_count(), (int)is_recording,
                    (int)light_sleep_active, bat_last_pct, ctrl_notify_dropped,
                    (int)adv_tier);
-            for (int i = 0; i < MAX_CONNS; i++) {
+            for (int i = 0; atomic_get(&debug_active) && i < MAX_CONNS; i++) {
                 struct bt_conn_info info;
 
                 if (connections[i] &&
                     bt_conn_get_info(connections[i], &info) == 0) {
-                    printk(" c%d=%u/%u/%u", i, info.le.interval,
+                    APP_TRACE(" c%d=%u/%u/%u", i, info.le.interval,
                            info.le.latency, info.le.timeout);
                 }
             }
-            printk("\n");
+            APP_TRACE("\n");
         }
 
         /* Battery polling — force immediate re-read on USB disconnect */

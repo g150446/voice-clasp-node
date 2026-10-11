@@ -15,6 +15,7 @@ gesture_monitor.py — BLE接続して IMU イベントを表示する
   0xD1  imu_int_fired    GPIO割り込み発火（WAKE_UP_SRC）
 """
 
+from device_debug import DebugControl
 import asyncio
 import struct
 import sys
@@ -79,12 +80,14 @@ async def main():
     print(f"Found: {device.address}. Connecting...")
     async with BleakClient(device) as client:
         print("Connected.\n")
-        await client.start_notify(AUDIO_TX_UUID, on_notify)
-        try:
-            while client.is_connected:
-                await asyncio.sleep(0.1)
-        except KeyboardInterrupt:
-            pass
+        debug = DebugControl()
+        await client.start_notify(AUDIO_TX_UUID, debug.wrap(on_notify))
+        async with debug.session(client):
+            try:
+                while client.is_connected:
+                    await asyncio.sleep(0.1)
+            except KeyboardInterrupt:
+                pass
     print("Disconnected.")
 
 

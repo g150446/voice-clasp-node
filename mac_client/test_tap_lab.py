@@ -7,6 +7,7 @@ class ReplayTest(unittest.TestCase):
     def setUpClass(cls): cls.replay = Replay()
 
     def trace(self, strikes):
+        # +/-4 g -> 0.000122 g/LSB: 8197 LSB = 1.0 g rest, 21311 LSB = 2.6 g tap.
         rows = [[0, 0, 8197, 0] for _ in range(900)]
         for start, duration in strikes:
             for i in range(start, start + duration): rows[i][2] = 21311

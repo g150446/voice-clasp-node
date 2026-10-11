@@ -12,7 +12,7 @@ bool tap_config_valid(const struct tap_config *c)
     return isfinite(c->quiet_g) && c->quiet_g >= 0.05f && c->quiet_g <= 1.0f &&
         isfinite(c->peak_g) && c->peak_g > c->quiet_g && c->peak_g <= 4.0f &&
         isfinite(c->edge_g) && c->edge_g >= 0.05f && c->edge_g <= 4.0f &&
-        isfinite(c->dominance) && c->dominance >= 0.5f && c->dominance <= 4.0f &&
+        isfinite(c->dominance) && c->dominance >= 0.0f && c->dominance <= 4.0f &&
         isfinite(c->gravity_alpha) && c->gravity_alpha >= 0.001f && c->gravity_alpha <= 0.1f &&
         isfinite(c->noise_multiplier) && c->noise_multiplier >= 1.0f && c->noise_multiplier <= 10.0f &&
         c->pre_quiet_ms >= 5 && c->pre_quiet_ms <= 200 &&
@@ -44,20 +44,24 @@ enum tap_result tap_detector_push_config(struct tap_detector *d, float x, float 
         linear[i] = a[i] - d->gravity[i];
         d->gravity[i] += c->gravity_alpha * linear[i];
     }
-    float az = fabsf(linear[2]);
-    float lateral = fmaxf(fabsf(linear[0]), fabsf(linear[1]));
-    float amplitude = fmaxf(az, lateral);
-    float edge = fabsf(linear[2] - d->previous_z);
-    d->previous_z = linear[2];
+    /* Orientation-independent impact: the magnitude of the gravity-free
+     * acceleration, not any single board axis. The previous axis-dominance
+     * gate rejected real taps whose impulse was lateral (posture-dependent
+     * double-tap misses), so it is gone; tap-vs-motion separation now rests on
+     * the rise rate, edge, peak gate, and pulse-width cap. */
+    float magnitude = sqrtf(linear[0] * linear[0] + linear[1] * linear[1] +
+                            linear[2] * linear[2]);
+    float edge = fabsf(magnitude - d->previous_magnitude);
+    d->previous_magnitude = magnitude;
     float threshold = fmaxf(c->peak_g, c->noise_multiplier * d->noise);
     /* Slow background estimate; a short strike must not raise its own gate. */
     if (!d->pulse) {
-        d->noise += 0.005f * (fminf(amplitude, 1.0f) - d->noise);
+        d->noise += 0.005f * (fminf(magnitude, 1.0f) - d->noise);
     }
     if (d->quiet >= SAMPLES(c->pre_quiet_ms)) {
         d->last_quiet_sample = d->sample - 1;
     }
-    d->quiet = amplitude < c->quiet_g ? d->quiet + (d->quiet < WARMUP) : 0;
+    d->quiet = magnitude < c->quiet_g ? d->quiet + (d->quiet < WARMUP) : 0;
     if (d->warmup < WARMUP) {
         d->warmup++;
         return TAP_NONE;
@@ -65,8 +69,8 @@ enum tap_result tap_detector_push_config(struct tap_detector *d, float x, float 
 
     if (!d->pulse && d->sample >= d->blocked_until &&
         d->last_quiet_sample != 0 &&
-        d->sample - d->last_quiet_sample <= SAMPLES(c->max_rise_ms) && az >= threshold &&
-        az >= c->dominance * lateral && edge >= c->edge_g &&
+        d->sample - d->last_quiet_sample <= SAMPLES(c->max_rise_ms) &&
+        magnitude >= threshold && edge >= c->edge_g &&
         (d->last_strike == 0 || d->sample - d->last_strike >= SAMPLES(c->min_gap_ms))) {
         d->pulse = true;
         d->pulse_rejected = false;
@@ -75,20 +79,17 @@ enum tap_result tap_detector_push_config(struct tap_detector *d, float x, float 
          * the rise in pulse width rather than demanding a one-sample jump. */
         d->pulse_start = d->last_quiet_sample + 1;
         d->pulse_quiet = 0;
-        d->peak_z = az;
-        d->peak_lateral = lateral;
+        d->peak_magnitude = magnitude;
     }
     if (d->pulse) {
-        d->peak_z = fmaxf(d->peak_z, az);
-        d->peak_lateral = fmaxf(d->peak_lateral, lateral);
-        d->pulse_quiet = amplitude < c->quiet_g ? d->pulse_quiet + 1 : 0;
+        d->peak_magnitude = fmaxf(d->peak_magnitude, magnitude);
+        d->pulse_quiet = magnitude < c->quiet_g ? d->pulse_quiet + 1 : 0;
         if (d->sample - d->pulse_start - d->pulse_quiet > SAMPLES(c->max_pulse_ms)) {
             d->pulse_rejected = true;
         }
         if (d->pulse_quiet >= SAMPLES(c->post_quiet_ms)) {
-            /* Direction is checked at the rising edge. A valid normal
-             * impact can ring laterally afterwards, so comparing peaks
-             * from different instants wrongly rejects an actual tap. */
+            /* The pulse closes once the magnitude returns below the quiet
+             * gate; only the width cap can invalidate an impact. */
             bool valid = !d->pulse_rejected;
             d->pulse = false;
             if (valid) {

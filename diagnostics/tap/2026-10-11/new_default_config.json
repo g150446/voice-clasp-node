@@ -1,0 +1,1 @@
+{"quiet_g":0.5,"peak_g":1.0,"edge_g":0.3,"dominance":0.0,"gravity_alpha":0.015,"noise_multiplier":4.0,"pre_quiet_ms":15,"max_rise_ms":15,"post_quiet_ms":20,"max_pulse_ms":40,"min_gap_ms":80,"max_gap_ms":350,"cooldown_ms":700,"suppress_ms":1500}

@@ -9,7 +9,12 @@ project(nordic_main)
 
 target_sources(app PRIVATE
     src/main.c
+    src/debug_session.c
+    src/tap_processing.c
     src/tap_detector.c
     src/audio_capture.c
     src/adpcm.c
 )
+
+# Preserve detector rounding when moving from software floating point to FPU.
+target_compile_options(app PRIVATE -ffp-contract=off)
