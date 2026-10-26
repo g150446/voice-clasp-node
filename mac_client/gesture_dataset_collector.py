@@ -110,6 +110,7 @@ class TrialCollector:
     async def connect(self) -> None:
         try:
             from bleak import BleakClient, BleakScanner
+            from node_names import find_node
         except ImportError as exc:
             raise RuntimeError("bleakをインストールしてください") from exc
         self.loop = asyncio.get_running_loop()
@@ -118,7 +119,7 @@ class TrialCollector:
             self.address = self.args.address
         else:
             print(f"BLE接続準備中: {self.args.device}", flush=True)
-            target = await BleakScanner.find_device_by_name(
+            target = await find_node(
                 self.args.device, timeout=self.args.scan_timeout
             )
             if target is None:

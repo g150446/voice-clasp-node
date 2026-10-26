@@ -80,6 +80,7 @@ def inspect(data, flags):
 async def ble(args):
     from device_debug import DebugControl
     from bleak import BleakClient, BleakScanner
+    from node_names import find_node
     queue = asyncio.Queue()
     tap_events = []
     debug = DebugControl()
@@ -94,9 +95,9 @@ async def ble(args):
                                'host_time': asyncio.get_running_loop().time()})
             print('Notification:', tap_events[-1]['kind'], flush=True)
 
-    print('Scanning for HarnessNode...', flush=True)
-    device = await BleakScanner.find_device_by_name('HarnessNode', timeout=15)
-    if not device: raise RuntimeError('HarnessNode not found')
+    print('Scanning for the node (ClaspNode / HarnessNode)...', flush=True)
+    device = await find_node(None, timeout=15)
+    if not device: raise RuntimeError('node (ClaspNode / HarnessNode) not found')
     print(f'Found {device.name} [{device.address}]', flush=True)
     async with BleakClient(device) as client:
         await client.start_notify(TX, debug.wrap(notify))

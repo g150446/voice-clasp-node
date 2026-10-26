@@ -7,6 +7,7 @@ Connects via BLE and reads Battery Service (0x180F) + dumps all services.
 import asyncio
 import sys
 from bleak import BleakClient, BleakScanner
+from node_names import find_node
 
 DEVICE_NAME = "HarnessNode"
 BATTERY_SERVICE_UUID  = "0000180f-0000-1000-8000-00805f9b34fb"
@@ -15,7 +16,7 @@ BATTERY_LEVEL_UUID    = "00002a19-0000-1000-8000-00805f9b34fb"
 
 async def main():
     print(f"Scanning for '{DEVICE_NAME}'...")
-    device = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=10.0)
+    device = await find_node(DEVICE_NAME, timeout=10.0)
     if device is None:
         print(f"Device '{DEVICE_NAME}' not found.")
         sys.exit(1)

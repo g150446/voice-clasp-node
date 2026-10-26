@@ -17,6 +17,7 @@ import sys
 from datetime import datetime
 
 from bleak import BleakClient, BleakScanner
+from node_names import find_node
 
 DEVICE_NAME = "HarnessNode"
 SHOW_GESTURE_DIAG = False
@@ -113,7 +114,7 @@ def on_notify(_sender, data: bytes) -> None:
 
 async def main_async(duration: float, scan_timeout: float, writes) -> int:
     log(f"Scanning for {DEVICE_NAME!r} ({scan_timeout:.0f}s)...")
-    device = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=scan_timeout)
+    device = await find_node(DEVICE_NAME, timeout=scan_timeout)
     if device is None:
         log(f"NOT FOUND: {DEVICE_NAME} is not advertising.")
         return 2

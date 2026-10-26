@@ -11,6 +11,7 @@ import subprocess
 import time
 
 from bleak import BleakClient, BleakScanner
+from node_names import find_node
 
 TX = "00000002-0000-1000-8000-00805f9b34fb"
 RX = "00000003-0000-1000-8000-00805f9b34fb"
@@ -42,10 +43,10 @@ async def run(kind):
             values = struct.unpack_from("<6I4f", data, 3)
             stats_queue.put_nowait(values)
 
-    print("Scanning for HarnessNode...", flush=True)
-    device = await BleakScanner.find_device_by_name("HarnessNode", timeout=15)
+    print("Scanning for the node (ClaspNode / HarnessNode)...", flush=True)
+    device = await find_node(None, timeout=15)
     if not device:
-        raise RuntimeError("HarnessNode not found")
+        raise RuntimeError("node (ClaspNode / HarnessNode) not found")
     print(f"Found {device.name} [{device.address}]", flush=True)
     async with BleakClient(device) as client:
         debug = DebugControl()

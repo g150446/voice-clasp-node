@@ -18,6 +18,7 @@ import csv
 import argparse
 from datetime import datetime
 from bleak import BleakClient, BleakScanner
+from node_names import is_node_name
 
 DEVICE_NAME   = "HarnessNode"
 AUDIO_TX_UUID = "00000002-0000-1000-8000-00805f9b34fb"
@@ -78,7 +79,7 @@ async def run(output_path: str):
 
     print("Scanning...")
     devices = await BleakScanner.discover(timeout=5.0)
-    addr = next((d.address for d in devices if d.name == DEVICE_NAME), None)
+    addr = next((d.address for d in devices if is_node_name(d.name)), None)
     if not addr:
         print("ERROR: デバイスが見つかりません。電源とアドバタイズを確認してください。")
         return

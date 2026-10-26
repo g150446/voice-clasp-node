@@ -28,6 +28,7 @@ import time
 from datetime import datetime
 
 from bleak import BleakClient, BleakScanner
+from node_names import find_node
 
 DEVICE_NAME = "HarnessNode"
 AUDIO_TX_UUID = "00000002-0000-1000-8000-00805f9b34fb"
@@ -87,7 +88,7 @@ async def main_async(uf2: str | None, scan_timeout: float) -> int:
         return 0
 
     log(f"Scanning for {DEVICE_NAME!r} ({scan_timeout:.0f}s)...")
-    device = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=scan_timeout)
+    device = await find_node(DEVICE_NAME, timeout=scan_timeout)
     if device is None:
         log(f"NOT FOUND: {DEVICE_NAME} is not advertising.")
         log("If it is asleep in SYSTEMOFF, tap the board once to wake it.")

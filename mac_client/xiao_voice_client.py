@@ -38,8 +38,8 @@ except ImportError:
 # Configuration
 # ============================================================================
 
-PRIMARY_DEVICE_NAME = "HarnessNode"
-LEGACY_DEVICE_NAMES = ("XIAOVoice",)
+PRIMARY_DEVICE_NAME = "ClaspNode"
+LEGACY_DEVICE_NAMES = ("HarnessNode", "XIAOVoice")
 DEVICE_NAMES = (PRIMARY_DEVICE_NAME, *LEGACY_DEVICE_NAMES)
 
 # Audio Service UUIDs
