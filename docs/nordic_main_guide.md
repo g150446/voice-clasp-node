@@ -1,6 +1,6 @@
 # HarnessNode / nordic-main ファームウェア運用ガイド
 
-`harness-node` リポジトリで現在メインとなっている、XIAO nRF52840 Sense 向けのジェスチャートリガー式 BLE 音声ファームウェアです。腕の動きを IMU で検知し、録音の開始・停止を自動制御します。
+`voice-clasp-node` リポジトリで現在メインとなっている、XIAO nRF52840 Sense 向けのジェスチャートリガー式 BLE 音声ファームウェアです。腕の動きを IMU で検知し、録音の開始・停止を自動制御します。
 
 ---
 
@@ -73,8 +73,8 @@ cd nordic-main
 ```bash
 # NCS v2.9.2 の west ワークスペースで実行すること
 west build -p always --sysbuild -b xiao_ble/nrf52840/sense \
-  /path/to/harness-node/nordic-main \
-  --build-dir /path/to/harness-node/nordic-main/build
+  /path/to/voice-clasp-node/nordic-main \
+  --build-dir /path/to/voice-clasp-node/nordic-main/build
 ```
 
 - **必ず** `--sysbuild`（`sysbuild.conf` で MCUboot 有効）
@@ -469,7 +469,7 @@ gyro X/Zは挙上に伴う複合回転を含む。録音停止は手下ろし（
 ```bash
 cd mac_client
 venv/bin/python gesture_validator.py --trials 1 --window 15 \
-  --json-output /private/tmp/harness-node-volar-sequence.json
+  --json-output /private/tmp/voice-clasp-node-volar-sequence.json
 venv/bin/python gesture_validator.py --self-test
 ```
 
@@ -494,7 +494,7 @@ python3 gesture_classifier.py
 ```bash
 # sysbuild の west configure 引数に C フラグを足す
 west build -p always --sysbuild -b xiao_ble/nrf52840/sense \
-  /path/to/harness-node/nordic-main --build-dir /tmp/harness-node-debug \
+  /path/to/voice-clasp-node/nordic-main --build-dir /tmp/voice-clasp-node-debug \
   -- -DEXTRA_CFLAGS=-DGESTURE_DEBUG_HISTORY=1
 ```
 

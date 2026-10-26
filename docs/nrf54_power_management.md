@@ -62,7 +62,7 @@ BLE 接続のたびに 25 サンプル × 25 ms ≈ **0.6 秒のキャリブレ�
 
 ```bash
 # ビルド & フラッシュ
-bash harness-node/nrf54-handy/build_and_flash.sh
+bash voice-clasp-node/nrf54-handy/build_and_flash.sh
 
 # シリアルモニタ
 screen $(ls /dev/tty.usbmodem* | head -1) 115200

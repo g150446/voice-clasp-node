@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Harness Node - Mac Client for XIAO nRF52840 / nRF54L15 Sense
+Voice Clasp Node - Mac Client for XIAO nRF52840 / nRF54L15 Sense
 
 Connects to XIAO nRF52840 Sense or XIAO nRF54L15 Sense running
 nordic-main / nrf54-handy firmware.
@@ -479,7 +479,7 @@ async def interactive_control(client: XiaoBleClient):
 
 async def main():
     print("=" * 60)
-    print("Harness Node - Mac Client")
+    print("Voice Clasp Node - Mac Client")
     print("=" * 60)
     print()
 

@@ -71,8 +71,8 @@ Manual west (must match scripts):
 ```bash
 # From NCS workspace (e.g. /opt/nordic/ncs/v2.9.2)
 west build -p always --sysbuild -b xiao_ble/nrf52840/sense \
-  /path/to/harness-node/nordic-main \
-  --build-dir /path/to/harness-node/nordic-main/build
+  /path/to/voice-clasp-node/nordic-main \
+  --build-dir /path/to/voice-clasp-node/nordic-main/build
 ```
 
 - **Always** `--sysbuild` for this app (`sysbuild.conf` enables MCUboot).

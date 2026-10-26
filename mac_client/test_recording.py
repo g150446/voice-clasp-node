@@ -53,7 +53,7 @@ SERIAL_PORT     = "/dev/tty.usbmodem1101"
 SERIAL_BAUD     = 115200
 
 ANDROID_SERIAL  = "192.168.86.144:5555"   # WiFi adb target
-ANDROID_PKG       = "com.g150446.voiceharness"
+ANDROID_PKG       = "com.g150446.voiceclasp"
 ANDROID_ACTIVITY  = f"{ANDROID_PKG}/.MainActivity"
 ANDROID_PREFS_PATH = f"/data/data/{ANDROID_PKG}/shared_prefs/ble_connection_prefs.xml"
 
@@ -131,7 +131,7 @@ def _parse_bounds(bounds_str: str) -> tuple[int, int]:
 
 def adb_dump_ui() -> str:
     adb("shell", "uiautomator", "dump", "/sdcard/ui.xml")
-    local = "/tmp/voice_harness_ui.xml"
+    local = "/tmp/voice_clasp_ui.xml"
     adb("pull", "/sdcard/ui.xml", local)
     return local
 

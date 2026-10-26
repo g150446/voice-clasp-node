@@ -1,10 +1,11 @@
-# Harness Node
+# Voice Clasp Node
 
 Bidirectional BLE Audio Streaming for XIAO Boards.
 
-This repository was renamed from `voice-bridge-ble` to `harness-node`.
+This repository was renamed from `voice-bridge-ble` to `harness-node`, and then to `voice-clasp-node`.
 The current nRF52840 Sense firmware path is `nordic-main/`, and its BLE
-device name is `HarnessNode`.
+device name is `HarnessNode`; the name is kept unchanged on purpose, because the
+Android app ([voice-clasp-android](https://github.com/g150446/voice-clasp-android)) finds the band by it.
 
 Supports:
 - **XIAO ESP32S3 Sense** (ESP-IDF)
@@ -14,7 +15,7 @@ Supports:
 ## Project Structure
 
 ```
-harness-node/
+voice-clasp-node/
 ├── esp32s3/                   # ESP-IDF firmware (ESP32S3)
 │   ├── main.c                 # Main application
 │   ├── adpcm.c/h              # IMA ADPCM codec

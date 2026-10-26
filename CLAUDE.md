@@ -1,4 +1,4 @@
-# Claude / coding-agent notes for harness-node
+# Claude / coding-agent notes for voice-clasp-node
 
 Follow **`AGENTS.md`** at the repo root for all agent behavior (terminal lifecycle,
 hardware tests, and nordic-main build rules).
