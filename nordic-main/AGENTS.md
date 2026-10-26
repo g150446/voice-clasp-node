@@ -1,6 +1,6 @@
 # nordic-main agent notes
 
-Firmware for **Seeed XIAO nRF52840 Sense** (BLE name `HarnessNode`).
+Firmware for **Seeed XIAO nRF52840 Sense** (BLE name `ClaspNode`; `HarnessNode` before 0.0.117).
 
 ## Board (mandatory)
 

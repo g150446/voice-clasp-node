@@ -67,7 +67,7 @@ bool app_debug_enabled(void) { return atomic_get(&debug_active) != 0; }
  * Configuration
  * ============================================================================ */
 
-#define BLE_DEVICE_NAME         "HarnessNode"
+#define BLE_DEVICE_NAME         "ClaspNode"
 #define PCM_PACKET_SIZE         200
 #define AUDIO_FRAME_SAMPLES     320   /* 20 ms @ 16 kHz */
 #define AUDIO_FRAME_BYTES       (AUDIO_FRAME_SAMPLES * sizeof(int16_t))
