@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import math
+import re
 import struct
 from pathlib import Path
 from typing import Any, Optional
@@ -130,6 +131,93 @@ def load_trajectory_csv(path: Path) -> dict[str, Any]:
                 sample[key] = float(row[key]) if row[key] else None
             samples.append(sample)
     return {"samples": samples, "complete": True}
+
+
+def load_android_trajectory_csv(path: Path) -> dict[str, Any]:
+    """Load the enriched CSV emitted by Android's GestureTrajectoryStore.
+
+    Android prefixes the ordinary sample table with one ``# session`` record
+    and optional ``# milestone`` / ``# live`` diagnostics.  Normalize the
+    sample field names to the same shape as :func:`load_trajectory_csv` so
+    offline evaluators can accept either source without special cases.
+    """
+    meta: dict[str, Any] = {}
+    milestones: list[dict[str, Any]] = []
+    live: list[dict[str, Any]] = []
+    sample_lines: list[str] = []
+
+    def parse_value(value: str) -> Any:
+        if value.lower() in ("true", "false"):
+            return value.lower() == "true"
+        try:
+            return int(value, 0)
+        except ValueError:
+            try:
+                return float(value)
+            except ValueError:
+                return value
+
+    def parse_diag(line: str, prefix: str) -> dict[str, Any]:
+        payload, _, label = line[len(prefix):].strip().partition("  ")
+        fields = next(csv.reader([payload]))
+        if len(fields) != 6:
+            raise ValueError(f"invalid {prefix.strip()} row in {path}: {line}")
+        stage_name, _, reason_name = label.partition("/")
+        return {
+            "t_ms": int(fields[0]),
+            "stage": int(fields[1], 0),
+            "reason": int(fields[2], 0),
+            "v1": float(fields[3]),
+            "v2": float(fields[4]),
+            "v3": float(fields[5]),
+            "stage_name": stage_name,
+            "reason_name": reason_name,
+        }
+
+    with path.open(encoding="utf-8") as handle:
+        for raw in handle:
+            line = raw.rstrip("\r\n")
+            if line.startswith("# session="):
+                for key, value in re.findall(r"(\w+)=([^\s]+)", line[2:]):
+                    meta[key] = parse_value(value)
+            elif line.startswith("# milestone "):
+                milestones.append(parse_diag(line, "# milestone "))
+            elif line.startswith("# live "):
+                live.append(parse_diag(line, "# live "))
+            elif line and not line.startswith("#"):
+                sample_lines.append(line)
+
+    if not sample_lines:
+        raise ValueError(f"Android trajectory CSV has no sample table: {path}")
+    samples: list[dict[str, Any]] = []
+    for row in csv.DictReader(sample_lines):
+        flags = int(row["flags"])
+        samples.append({
+            "index": len(samples),
+            "elapsed_ms": int(row["t_ms"]),
+            "flags": flags,
+            "gyro_powered": bool(flags & 0x01),
+            "gyro_read_valid": bool(flags & 0x02),
+            "gyro_settled": bool(flags & 0x04),
+            "ax_ms2": float(row["ax"]),
+            "ay_ms2": float(row["ay"]),
+            "az_ms2": float(row["az"]),
+            "gx_dps": float(row["gx"]) if row["gx"] else None,
+            "gy_dps": float(row["gy"]) if row["gy"] else None,
+            "gz_dps": float(row["gz"]) if row["gz"] else None,
+        })
+    complete = (
+        not bool(meta.get("overflow", False))
+        and not bool(meta.get("notify_error", False))
+        and int(meta.get("declared", len(samples))) == len(samples)
+    )
+    return {
+        "samples": samples,
+        "complete": complete,
+        "meta": meta,
+        "milestones": milestones,
+        "live": live,
+    }
 
 
 def plot_trajectory(

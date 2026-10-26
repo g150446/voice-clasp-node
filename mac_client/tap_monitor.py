@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """tap_monitor.py — connect to HarnessNode and dump every TX notification.
 
-Read-only: subscribes to the audio TX characteristic and prints raw hex plus a
-decoded label for each event packet.  Exits after --duration seconds.
+Enables a connection-owned debug session, subscribes to TX and prints raw hex
+plus decoded events. Optional --write pokes legacy tap registers. Exits after
+--duration seconds and restores normal mode (requires firmware 0.0.112+).
 
     venv/bin/python3 mac_client/tap_monitor.py --duration 60
 """
 
 import argparse
+from device_debug import DebugControl
 import asyncio
 import struct
 import subprocess
@@ -15,6 +17,7 @@ import sys
 from datetime import datetime
 
 from bleak import BleakClient, BleakScanner
+from node_names import find_node
 
 DEVICE_NAME = "HarnessNode"
 SHOW_GESTURE_DIAG = False
@@ -44,7 +47,7 @@ DIAG_REGS = ["CTRL1_XL", "CTRL6_C", "TAP_CFG", "TAP_THS_6D",
 DIAG_EXPECT = {
     "CTRL1_XL": "ODR>=416Hz -> high nibble 0x6+",
     "TAP_CFG": "0x83 (INT_EN|TAP_Z|LIR)",
-    "TAP_THS_6D": "0x08 (0.5g)",
+    "TAP_THS_6D": "0x11 (1.0625g)",
     "INT_DUR2": "0x4a",
     "WAKE_UP_THS": "bit7 set (double enable)",
     "MD1_CFG": "bits 6+3 set (single+double)",
@@ -111,7 +114,7 @@ def on_notify(_sender, data: bytes) -> None:
 
 async def main_async(duration: float, scan_timeout: float, writes) -> int:
     log(f"Scanning for {DEVICE_NAME!r} ({scan_timeout:.0f}s)...")
-    device = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=scan_timeout)
+    device = await find_node(DEVICE_NAME, timeout=scan_timeout)
     if device is None:
         log(f"NOT FOUND: {DEVICE_NAME} is not advertising.")
         return 2
@@ -119,21 +122,23 @@ async def main_async(duration: float, scan_timeout: float, writes) -> int:
     log(f"Found {device.address} — connecting...")
     async with BleakClient(device) as client:
         log("Connected. Subscribing to TX notifications.")
-        await client.start_notify(AUDIO_TX_UUID, on_notify)
-        for spec in writes:
-            reg_s, _, val_s = spec.partition(":")
-            reg, val = int(reg_s, 0), int(val_s, 0)
-            log(f"-> write IMU reg 0x{reg:02x} = 0x{val:02x}")
-            await client.write_gatt_char(
-                AUDIO_RX_UUID, bytes([0x50, reg, val]), response=True)
-            await asyncio.sleep(0.3)
-        log(f"Listening for {duration:.0f}s — tap the board now.")
-        cue("Glass", "テスト開始。タップしてください")
-        end = asyncio.get_event_loop().time() + duration
-        while client.is_connected and asyncio.get_event_loop().time() < end:
-            await asyncio.sleep(0.1)
-        log("Done listening.")
-        cue("Submarine", "テスト終了")
+        debug = DebugControl()
+        await client.start_notify(AUDIO_TX_UUID, debug.wrap(on_notify))
+        async with debug.session(client):
+            for spec in writes:
+                reg_s, _, val_s = spec.partition(":")
+                reg, val = int(reg_s, 0), int(val_s, 0)
+                log(f"-> write IMU reg 0x{reg:02x} = 0x{val:02x}")
+                await client.write_gatt_char(
+                    AUDIO_RX_UUID, bytes([0x50, reg, val]), response=True)
+                await asyncio.sleep(0.3)
+            log(f"Listening for {duration:.0f}s — tap the board now.")
+            cue("Glass", "テスト開始。タップしてください")
+            end = asyncio.get_event_loop().time() + duration
+            while client.is_connected and asyncio.get_event_loop().time() < end:
+                await asyncio.sleep(0.1)
+            log("Done listening.")
+            cue("Submarine", "テスト終了")
     log("Disconnected.")
     return 0
 

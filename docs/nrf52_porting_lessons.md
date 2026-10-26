@@ -153,15 +153,28 @@ set(PM_STATIC_YML_FILE ${CMAKE_CURRENT_SOURCE_DIR}/pm_static.yml)
 
 ### 1200 baud トリガーは Zephyr では効かない
 
-Arduino フレームワークでは USB CDC ACM ポートを 1200 baud でオープン→クローズするとブートローダに入る「magic baud」機能がある。Zephyr の USB CDC ACM ドライバはこの機能を実装していないため、物理的なリセットボタンのダブルタップが唯一の手段。
+Arduino フレームワークでは USB CDC ACM ポートを 1200 baud でオープン→クローズするとブートローダに入る「magic baud」機能がある。Zephyr の USB CDC ACM ドライバはこの機能を実装していないため、この手では入れない。**代わりに下の GPREGRET 経路を使う**（`nordic-main 0.0.106+`）。ファーム側にコマンドが無い場合は物理的なダブルタップが唯一の手段。
 
 ### adafruit-nrfutil はシリアル DFU に使えない
 
 `adafruit-nrfutil dfu serial` はアプリが DFU モード（ブートローダ実行中）である必要がある。Zephyr アプリは nRF5 SDK の DFU プロトコルを実装していないため、serial DFU は使えない。
 
-### GPREGRET による DFU トリガー
+### GPREGRET による DFU トリガー（`nordic-main 0.0.106+` で実装・実測済み）
 
-`NRF_POWER->GPREGRET = 0x57` + `sys_reboot()` で Adafruit ブートローダの DFU モードを起動できる（ブートローダが GPREGRET を確認するため）。ただし UF2 モードか DFU シリアルモードかはブートローダ版により異なる。
+`NRF_POWER->GPREGRET = 0x57` + `sys_reboot()` で Adafruit ブートローダの UF2 モードに入れる。
+nordic-main では RX `0x60 0xB0 0x07` とシリアル `'b'` として実装済み
+（`nordic_main_guide.md` の「UF2 ブートローダへ再起動する」）。
+ブートローダ `0.6.2-12-g459adc9` / Seeed XIAO nRF52840 Sense での実測：
+
+- **USB（VBUS）が必須。** 未接続だとブートローダは DFU モードに留まらずアプリへ素通りする。
+  このとき `hwinfo` の reset cause は `SOFTWARE` のみで `WATCHDOG` は立たない
+  ＝ ブートローダが待機して犬に殺されたのではなく、最初から素通りしている
+- USB があればダブルタップ不要でマウントされ、**60 秒経っても維持される**。
+  つまりブートローダは自分でウォッチドッグに給餌している
+- nRF52840 の WDT は `WDT_TASKS_STOP` が無く**ソフトで停止できない**。止まるのは
+  POR / ブラウンアウト / **ピンリセット** / SYSTEMOFF 復帰のみで、`sys_reboot()` は
+  ソフトリセットなので WDT は armed のまま引き継がれる。ダブルタップ（ピンリセット）だと
+  クリアされるという非対称性があるので、この経路はブートローダの給餌に依存している
 
 ---
 

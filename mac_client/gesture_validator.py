@@ -20,6 +20,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+from device_debug import DebugControl
 import asyncio
 import json
 import math
@@ -1587,6 +1588,7 @@ class GestureValidator:
     async def connect(self) -> None:
         try:
             from bleak import BleakClient, BleakScanner
+            from node_names import find_node
         except ImportError as exc:
             raise RuntimeError(
                 "bleak がありません。mac_client/venv/bin/pip install -r "
@@ -1599,7 +1601,7 @@ class GestureValidator:
             self.address = self.args.address
         else:
             print(f"BLE接続準備中: {self.args.device}", flush=True)
-            target = await BleakScanner.find_device_by_name(
+            target = await find_node(
                 self.args.device, timeout=self.args.scan_timeout
             )
             if target is None:
@@ -1613,22 +1615,29 @@ class GestureValidator:
             timeout=self.args.connect_timeout,
             disconnected_callback=self._on_disconnected,
         )
-        await self.client.connect()
-        await self.client.start_notify(AUDIO_TX_UUID, self._on_notify)
+        try:
+            await self.client.connect()
+            self.debug = DebugControl()
+            await self.client.start_notify(AUDIO_TX_UUID, self.debug.wrap(self._on_notify))
+            await self.debug.mode(self.client, 1)
 
-        # イベントはprimary接続だけへ送られるため、検証中だけprimaryを引き受ける。
-        await self._write_command(0x02)
-        print("BLE接続: OK", flush=True)
+            # イベントはprimary接続だけへ送られるため、検証中だけprimaryを引き受ける。
+            await self._write_command(0x02)
+            print("BLE接続: OK", flush=True)
 
-        # 接続前から録音中なら音声パケットが届く。その場合だけ停止して初期化する。
-        await asyncio.sleep(0.8)
-        if self.audio_seen.is_set():
-            await self._write_command(0x00)
-            await self._wait_for_event(EVT_RECORDING_STOP, timeout=3.0)
-        self._drain_events()
+            # 接続前から録音中なら音声パケットが届く。その場合だけ停止して初期化する。
+            await asyncio.sleep(0.8)
+            if self.audio_seen.is_set():
+                await self._write_command(0x00)
+                await self._wait_for_event(EVT_RECORDING_STOP, timeout=3.0)
+            self._drain_events()
 
-        if not self.args.skip_preflight:
-            await self.preflight()
+            if not self.args.skip_preflight:
+                await self.preflight()
+
+        except BaseException:
+            await self.disconnect()
+            raise
 
     async def preflight(self) -> None:
         """BLE writeとevent notifyの往復を実動作の前に検証する。"""
@@ -1658,10 +1667,12 @@ class GestureValidator:
             except Exception:
                 pass
             try:
-                await self.client.stop_notify(AUDIO_TX_UUID)
-            except Exception:
-                pass
-            await self.client.disconnect()
+                if self.client.is_connected and hasattr(self, 'debug'):
+                    await self.debug.mode(self.client, 2)
+            except Exception as exc:
+                print(f'Debug cleanup failed; disconnect restores normal: {exc}', flush=True)
+            finally:
+                await self.client.disconnect()
 
     async def _countdown(self, trial: int) -> None:
         print("", flush=True)
@@ -1694,6 +1705,7 @@ class GestureValidator:
         print("  >>> STOP GO <<< 掌は返さず腕を下ろしてください", flush=True)
 
     async def run_trial(self, trial: int) -> TrialResult:
+        await self.debug.mode(self.client, 1)
         self._drain_events()
         self._drain_trajectories()
         await self._countdown(trial)

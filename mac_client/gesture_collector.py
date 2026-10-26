@@ -10,6 +10,7 @@ Usage:
     python3 gesture_collector.py --output gesture_data.csv
 """
 
+from device_debug import DebugControl
 import asyncio
 import struct
 import time
@@ -17,6 +18,7 @@ import csv
 import argparse
 from datetime import datetime
 from bleak import BleakClient, BleakScanner
+from node_names import is_node_name
 
 DEVICE_NAME   = "HarnessNode"
 AUDIO_TX_UUID = "00000002-0000-1000-8000-00805f9b34fb"
@@ -77,7 +79,7 @@ async def run(output_path: str):
 
     print("Scanning...")
     devices = await BleakScanner.discover(timeout=5.0)
-    addr = next((d.address for d in devices if d.name == DEVICE_NAME), None)
+    addr = next((d.address for d in devices if is_node_name(d.name)), None)
     if not addr:
         print("ERROR: デバイスが見つかりません。電源とアドバタイズを確認してください。")
         return
@@ -87,56 +89,58 @@ async def run(output_path: str):
     col = Collector()
 
     async with BleakClient(addr) as client:
-        await client.start_notify(AUDIO_TX_UUID, col.on_notify)
-        loop = asyncio.get_event_loop()
+        debug = DebugControl()
+        await client.start_notify(AUDIO_TX_UUID, debug.wrap(col.on_notify))
+        async with debug.session(client):
+            loop = asyncio.get_event_loop()
 
-        # ── Phase 1: 録音開始ジェスチャー ──────────────────────────
-        print("=" * 60)
-        print("  Phase 1: 録音開始ジェスチャー")
-        print("  （腕を上げ → 握る → 手首を傾けるジェスチャー）")
-        print("=" * 60)
-        print("  5〜10 回繰り返してください。")
-        print()
-        print("  >>> 準備ができたら Enter を押してください（収集開始）")
-        await loop.run_in_executor(None, input, "")
+            # ── Phase 1: 録音開始ジェスチャー ──────────────────────────
+            print("=" * 60)
+            print("  Phase 1: 録音開始ジェスチャー")
+            print("  （腕を上げ → 握る → 手首を傾けるジェスチャー）")
+            print("=" * 60)
+            print("  5〜10 回繰り返してください。")
+            print()
+            print("  >>> 準備ができたら Enter を押してください（収集開始）")
+            await loop.run_in_executor(None, input, "")
 
-        col.current_label = "recording_start"
-        col.collecting    = True
-        print("  [収集中] ジェスチャーを行ってください...")
-        print()
-        print("  >>> 終わったら Enter を押してください（収集停止）")
-        await loop.run_in_executor(None, input, "")
-        col.collecting  = False
-        col._in_gesture = False
-        p1_count = col._gesture_id + 1
-        print(f"  → {p1_count} ジェスチャー記録")
-        print()
+            col.current_label = "recording_start"
+            col.collecting    = True
+            print("  [収集中] ジェスチャーを行ってください...")
+            print()
+            print("  >>> 終わったら Enter を押してください（収集停止）")
+            await loop.run_in_executor(None, input, "")
+            col.collecting  = False
+            col._in_gesture = False
+            p1_count = col._gesture_id + 1
+            print(f"  → {p1_count} ジェスチャー記録")
+            print()
 
-        await asyncio.sleep(1.0)
+            await asyncio.sleep(1.0)
 
-        # ── Phase 2: その他のジェスチャー ──────────────────────────
-        print("=" * 60)
-        print("  Phase 2: その他のジェスチャー")
-        print("  （腕振り・歩行・ランダムな動作など）")
-        print("=" * 60)
-        print("  5〜10 回繰り返してください。")
-        print()
-        print("  >>> 準備ができたら Enter を押してください（収集開始）")
-        await loop.run_in_executor(None, input, "")
+            # ── Phase 2: その他のジェスチャー ──────────────────────────
+            print("=" * 60)
+            print("  Phase 2: その他のジェスチャー")
+            print("  （腕振り・歩行・ランダムな動作など）")
+            print("=" * 60)
+            print("  5〜10 回繰り返してください。")
+            print()
+            print("  >>> 準備ができたら Enter を押してください（収集開始）")
+            await loop.run_in_executor(None, input, "")
 
-        col.current_label = "other_motion"
-        col.collecting    = True
-        print("  [収集中] ジェスチャーを行ってください...")
-        print()
-        print("  >>> 終わったら Enter を押してください（収集停止）")
-        await loop.run_in_executor(None, input, "")
-        col.collecting  = False
-        col._in_gesture = False
-        p2_count = col._gesture_id + 1 - p1_count
-        print(f"  → {p2_count} ジェスチャー記録")
-        print()
+            col.current_label = "other_motion"
+            col.collecting    = True
+            print("  [収集中] ジェスチャーを行ってください...")
+            print()
+            print("  >>> 終わったら Enter を押してください（収集停止）")
+            await loop.run_in_executor(None, input, "")
+            col.collecting  = False
+            col._in_gesture = False
+            p2_count = col._gesture_id + 1 - p1_count
+            print(f"  → {p2_count} ジェスチャー記録")
+            print()
 
-        await client.stop_notify(AUDIO_TX_UUID)
+            await client.stop_notify(AUDIO_TX_UUID)
 
     # ── 保存 ─────────────────────────────────────────────────────
     total_samples = len(col._samples)

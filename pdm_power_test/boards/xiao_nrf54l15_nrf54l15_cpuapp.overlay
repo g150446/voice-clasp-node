@@ -2,7 +2,8 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Keep regulator-boot-on: the LSM6DSL driver must probe while the shared
- * IMU/microphone rail is powered. main() switches the rail off before S0.
+ * IMU/microphone rail is powered. The power test may switch this rail off
+ * after device initialization, then turn it back on for later states.
  */
 
 / {

@@ -52,7 +52,7 @@ Android(MAC_HANDYモード)   nRF52840              Handy
         │── 0x03(yield) ─────────▶│                   │── 0x02(claim primary) ──▶│
         │                   primary_idx=1             │
         │                      │  conn_param_work      │
-        │◀── slow(200ms) ────────│── fast(7.5ms) ─────▶│
+        │◀── slow(100ms) ────────│── idle(30ms) ──────▶│
 ```
 
 ### Test B（Android プライマリ）の接続シーケンス
@@ -67,7 +67,7 @@ Handy(Test Aから継続)    nRF52840              Android(ANDROIDモード)
         │◀── 0x31(peer connected)──│                  │
         │  (stays primary, no re-claim)               │
         │                      │  conn_param_work      │
-        │◀── slow(200ms) ────────│── fast(7.5ms) ──────▶│
+        │◀── slow(100ms) ────────│── idle(30ms) ───────▶│
 ```
 
 ---
@@ -105,8 +105,11 @@ Silero VAD: rmsAfterDC=0.0012   ← ほぼ無音
 
 ### 設計方針
 
-- **プライマリ接続**（音声データを受け取る側）: 7.5 ms インターバル → ラジオ帯域を最大確保
-- **セカンダリ接続**（イベント通知のみ）: 200 ms インターバル → 接続維持しつつ帯域を最小消費
+- **プライマリ接続**（音声データを受け取る側）: 録音中だけ 7.5 ms。それ以外は 30–50 ms（FW `0.0.100+`）
+- **セカンダリ接続**（イベント通知のみ）: 常に 100–150 ms
+- **supervision timeout / GAP PPCP**: すべて 8 s。idle 中に間隔を再更新しない
+- **ウォッチドッグ 12 s**（FW `0.0.102+`）: supervision より必ず長くすること。理由は下の
+  「supervision timeout をウォッチドッグより長くしてはいけない」
 
 ### 実装（`main.c`）
 
@@ -119,17 +122,23 @@ static void conn_param_work_handler(struct k_work *work)
     static const struct bt_le_conn_param fast_param = {
         .interval_min = 6,    /* 7.5 ms */
         .interval_max = 12,   /* 15 ms  */
-        .latency = 0, .timeout = 400,
+        .latency = 0, .timeout = 800,
+    };
+    static const struct bt_le_conn_param idle_param = {
+        .interval_min = 24,   /* 30 ms */
+        .interval_max = 40,   /* 50 ms */
+        .latency = 0, .timeout = 800,
     };
     static const struct bt_le_conn_param slow_param = {
-        .interval_min = 160,  /* 200 ms */
-        .interval_max = 400,  /* 500 ms */
-        .latency = 0, .timeout = 400,
+        .interval_min = 80,   /* 100 ms */
+        .interval_max = 120,  /* 150 ms */
+        .latency = 0, .timeout = 800,
     };
+    bool primary_fast = /* recording only */;
     for (int i = 0; i < MAX_CONNS; i++) {
         if (!connections[i]) continue;
-        const struct bt_le_conn_param *p =
-            (i == primary_idx) ? &fast_param : &slow_param;
+        const struct bt_le_conn_param *p = (i != primary_idx) ? &slow_param
+            : (primary_fast ? &fast_param : &idle_param);
         bt_conn_le_param_update(connections[i], p);
     }
 }
@@ -137,7 +146,7 @@ static void conn_param_work_handler(struct k_work *work)
 
 ### 発動タイミング
 
-`audio_rx_write` 内で `0x02`（primary claim）または `0x03`（yield）を受信した際に **200 ms 後に発動**するようスケジュール：
+接続確立時、primary claim（RX `0x02`）/ yield（RX `0x03`）、録音開始・停止で **200 ms 後に発動**するようスケジュール：
 
 ```c
 k_work_schedule(&conn_param_work, K_MSEC(200));
@@ -149,9 +158,43 @@ BT コールバック内から直接 `bt_conn_le_param_update()` を呼ぶと BT
 
 `bt_conn_le_param_update()` はペリフェラルからセントラルへの **要求** であり、セントラルが拒否することもあります。
 
-- **Android**: 通常 7.5 ms–4000 ms の範囲は受け入れる
+- **Android**: 7.5 ms–4000 ms は受け入れることが多い。GAP PPCP の timeout が短い（Zephyr 既定 420 ms）と、探索後にそれを採用して Connection Timeout（HCI 0x08）で切る。`prj.conf` で PPCP を idle（30–50 ms / 8 s）に合わせること
 - **macOS (CoreBluetooth)**: 15 ms–2000 ms 程度は受け入れる
-- **拒否された場合**: 既存のインターバルのまま動作します（致命的エラーにはならない）
+- **拒否された場合**: 既存のインターバルのまま動作する（切断にはならないとは限らない。timeout をセット間で変えない）
+
+#### ペリフェラルでは要求は即座に送られない（`0.0.102` でログを訂正）
+
+`bt_conn_le_param_update()` はペリフェラルでは **何も送信せず**、
+`conn->interval_min/max` 等を保存して `BT_CONN_PERIPHERAL_PARAM_SET` を立てて
+`0` を返すだけ（`host/conn.c`）。実際の送信は接続確立時に仕込まれた
+`conn->deferred_work` が **T+5 s** に 1 回行う。
+
+- `0.0.100` までのログ `>>> conn_param_update[i]: idle(30ms)` は
+  **何も送っていない時点で出ていた**。`0.0.102` で
+  `>>> conn_param[i]: ... requested (host sends at T+5s)` に改めた
+- 受理されたかどうかの唯一の証拠は `>>> le_param_updated[i]`。
+  これが一度も出なければ、相手は要求を全部黙殺してリンクを自分のパラメータで
+  回している。`0.0.102` の `>>> DISCONN` は `params=...(never-updated)` でそれを示す
+- `CONFIG_BT_CONN_PARAM_RETRY_COUNT` 系は `BT_CONN_PERIPHERAL_PARAM_AUTO_UPDATE` が
+  立っているときだけ効く。アプリが自分で `bt_conn_le_param_update()` を呼ぶこの FW では
+  そのフラグは立たないので、**再送設定は死にコード**
+
+### supervision timeout をウォッチドッグより長くしてはいけない
+
+`0.0.100` が supervision を 4 s → 8 s に上げたことで、5 s のウォッチドッグより
+長くなり、「接続したまま放置すると切れてデバイスが消える」退行が出た。
+
+`bt_gatt_notify()` は ATT PDU を `K_FOREVER` で確保する（`host/att.c`。
+タイムアウトが付くのは response と confirmation だけ）。バッファは相手が
+LL ACK を返して初めて戻るので、**相手が黙るとメインループがそこで固まる**。
+
+- supervision < ウォッチドッグ … コントローラが先にリンクを切り、バッファが解放され、
+  ブロックが解けて餌やりが間に合う（`0.0.98`/`0.0.99` が偶然生き延びていた理由）
+- supervision > ウォッチドッグ … **必ずリセットする**。相手からは切断と区別できない
+
+`0.0.102` の不変条件: **`WDT_TIMEOUT_MS`（12 s）> supervision timeout（8 s）**。
+加えて制御系の通知は `notify_one()` の専用セマフォ経由にして、
+20 ms で枠が取れなければ捨てる（犬に餌をやるスレッドを止めない）。
 
 ---
 
@@ -204,7 +247,7 @@ android_set_priority("ANDROID")
 ```
 [XIAO] >>> conn[0] is primary
 [XIAO] >>> Primary yielded to conn[1]
-[XIAO] >>> conn_param_update[1]: fast(7.5ms)
+[XIAO] >>> conn_param_update[1]: idle(30ms)
 [XIAO] >>> send_event 0x01 -> primary[1]
 ```
 

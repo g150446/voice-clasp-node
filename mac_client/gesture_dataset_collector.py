@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from device_debug import DebugControl
 import asyncio
 import json
 import time
@@ -109,6 +110,7 @@ class TrialCollector:
     async def connect(self) -> None:
         try:
             from bleak import BleakClient, BleakScanner
+            from node_names import find_node
         except ImportError as exc:
             raise RuntimeError("bleakをインストールしてください") from exc
         self.loop = asyncio.get_running_loop()
@@ -117,7 +119,7 @@ class TrialCollector:
             self.address = self.args.address
         else:
             print(f"BLE接続準備中: {self.args.device}", flush=True)
-            target = await BleakScanner.find_device_by_name(
+            target = await find_node(
                 self.args.device, timeout=self.args.scan_timeout
             )
             if target is None:
@@ -128,15 +130,22 @@ class TrialCollector:
             timeout=self.args.connect_timeout,
             disconnected_callback=self.on_disconnected,
         )
-        await self.client.connect()
-        await self.client.start_notify(AUDIO_TX_UUID, self.on_notify)
-        await self.write_command(CMD_CLAIM_PRIMARY)
-        # Normalize a device left recording by another client or prior trial.
-        await self.write_command(CMD_STOP)
-        await asyncio.sleep(0.3)
-        while not self.event_queue.empty():
-            self.event_queue.get_nowait()
-        print(f"BLE接続: OK ({self.address})", flush=True)
+        try:
+            await self.client.connect()
+            self.debug = DebugControl()
+            await self.client.start_notify(AUDIO_TX_UUID, self.debug.wrap(self.on_notify))
+            await self.debug.mode(self.client, 1)
+            await self.write_command(CMD_CLAIM_PRIMARY)
+            # Normalize a device left recording by another client or prior trial.
+            await self.write_command(CMD_STOP)
+            await asyncio.sleep(0.3)
+            while not self.event_queue.empty():
+                self.event_queue.get_nowait()
+            print(f"BLE接続: OK ({self.address})", flush=True)
+
+        except BaseException:
+            await self.disconnect()
+            raise
 
     async def disconnect(self) -> None:
         if self.client is None:
@@ -148,12 +157,15 @@ class TrialCollector:
             except Exception:
                 pass
             try:
-                await self.client.stop_notify(AUDIO_TX_UUID)
-            except Exception:
-                pass
-            await self.client.disconnect()
+                if self.client.is_connected and hasattr(self, 'debug'):
+                    await self.debug.mode(self.client, 2)
+            except Exception as exc:
+                print(f'Debug cleanup failed; disconnect restores normal: {exc}', flush=True)
+            finally:
+                await self.client.disconnect()
 
     async def countdown(self) -> None:
+        await self.debug.mode(self.client, 1)
         instruction = INSTRUCTIONS[self.args.motion]
         print(f"  手: {self.args.hand} / 動作: {self.args.motion}", flush=True)
         print(f"  速度: {self.args.speed}", flush=True)

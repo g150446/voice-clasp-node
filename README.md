@@ -4,8 +4,10 @@ Bidirectional BLE Audio Streaming for XIAO Boards.
 
 This repository was renamed from `voice-bridge-ble` to `harness-node`, and then to `voice-clasp-node`.
 The current nRF52840 Sense firmware path is `nordic-main/`, and its BLE
-device name is `HarnessNode`; the name is kept unchanged on purpose, because the
-Android app ([voice-clasp-android](https://github.com/g150446/voice-clasp-android)) finds the band by it.
+device name is `ClaspNode` (`HarnessNode` before firmware 0.0.117). The Android app
+([voice-clasp-android](https://github.com/g150446/voice-clasp-android)) and `mac_client`
+accept both names until every node has been updated; the M5 / Echo boards still advertise
+`HarnessNode-*`.
 
 Supports:
 - **XIAO ESP32S3 Sense** (ESP-IDF)
@@ -142,7 +144,7 @@ Android app and Handy integration.
 
 PDM マイク音声 + LSM6DS3TR-C ジェスチャー検出 + BLE OTA + **バッテリー残量通知** を統合したファームウェアです。XIAOをリストバンドの手の甲側に配置し、掌上で0.5秒静止、挙上、掌下で400 ms静止すると録音を自動開始します（加速度常時 + ジャイロは0.5秒静止成立〜録音終了のみ）。ジェスチャー判別は **ファームウェア側で完結** します。
 
-LED は省電力・省発光寄りの挙動にしてあり、起動直後の白色点灯後は **アドバタイジング中 / BLE 接続済み待機中 / 単純なモーション検出中は消灯** します。LED が点灯するのは **録音ジェスチャー成立後の録音中（赤）** のみで、リモート未接続でも録音ジェスチャーが成立すれば赤点灯します。
+LED は起動直後に白 1 秒のあと、**未接続アドバタイズ中は青の遅い点滅**（200 ms ON / 1800 ms OFF）、**BLE 接続済み待機中 / 単純なモーション検出中は消灯**、**録音中は赤**です。
 
 バッテリー残量は **BLE Battery Service（UUID 0x180F）** で 1 分ごとに通知されます（録音停止直後にも即時更新）。nRF Connect アプリ等から Battery Level キャラクタリスティック（UUID 0x2A19）で読み取り可能です。
 
@@ -166,9 +168,27 @@ LED は省電力・省発光寄りの挙動にしてあり、起動直後の白�
 （0.0.69+）。掌上反転・静止のみでは止まらない。失敗パルスは `stop_near_miss`、
 録音経過で閾値を緩和（0.0.73）。詳細は `docs/flex_pronation_gesture.md`（現行 `0.0.74`）。
 
-#### ライトスリープ
+#### 省電力（FW `0.0.102+`）
 
-10 秒間モーションがなく録音中でもない場合、IMU ポーリング間隔を 25 ms → 50 ms に切り替え（BLE 接続は維持）。短い屈曲動作を取りこぼさないよう、従来の 500 ms より高速にしています。スリープ移行時に `0x20`、復帰時に `0x21` イベントを送信します。
+- **接続中・非録音**: primary の BLE 間隔は 30–50 ms。録音中だけ 7.5 ms。supervision timeout 8 s
+- **接続中のアドバタイズ**: 2 台目の枠が空いている間も 100–150 ms で回り続けていたのを、
+  接続数が変わってから 30 秒だけ高速、以降 **1–1.2 s** に落とす（`0.0.102+`）
+- **未接続で SYSTEMOFF**: コールドブート後は 3 分、**一度接続した後に落ちた場合は 30 分**（`0.0.102+`）。
+  電池 15% 未満は常に 3 分。シングル／ダブルどちらのタップでも起床する
+- **ライトスリープ**: 10 秒無モーションで IMU ポール 25→50 ms（BLE は維持）。効果は小さい
+
+詳細は `docs/nordic_main_guide.md` の「省電力」。
+
+#### アイドル切断とウォッチドッグ（`0.0.102` で修正）
+
+`0.0.100` まで、接続したまま放置すると Android が切断され、そのままデバイスが
+ディープスリープで見つからなくなることがあった。真因は BLE の切断ではなく
+**ウォッチドッグリセット**で、`bt_gatt_notify()` が ATT バッファを `K_FOREVER` で
+確保するため、相手が ACK を返さなくなるとメインループがそこで固まっていた。
+`0.0.100` が supervision を 4 s → 8 s に上げたことで 5 s のウォッチドッグより長くなり、
+必ず犬が先に吠えるようになっていた。`0.0.102` でウォッチドッグを 12 s にし、
+制御系の通知をブロックしない実装に変えた。診断用に `>>> HB #n` ハートビート、
+`>>> DISCONN ... reason=0x..`、`>>> CRASHBOX stage=...` をシリアルに出す。
 
 #### ビルド時のボード名（重要）
 
@@ -254,8 +274,12 @@ GO後の判定時間は既定15秒。BLE診断の生ログは画面へ出さず�
 グラフは上段が加速度（X/Y/Z、m/s²）、下段がジャイロ角速度（X/Y/Z、dps）です。
 灰色部分はジャイロ未取得期間（掌上0.5秒静止成立前の正常状態）です。
 
+FW `0.0.97+` では手首ジェスチャー検出は **既定オフ**（タップのみ）。
+タップ閾値は `TAP_THS_6D=0x11`（≈1.0625 g）。詳細は `docs/nordic_main_guide.md`。
+Android の「ジェスチャー録音」または RX `[0x07, 0x01]` で有効化する（RAM のみ、接続時に再送）。
+
 閾値調整前のラベル付き収集は、FW `0.0.91+` の IMU収集スイッチ（RX `0x06`）を
-ONにして行います（デバッグビルドの作り直しは不要）。
+ONにして行います（デバッグビルドの作り直しは不要）。ジェスチャー検出も ON が必要。
 推奨する最小構成は左右それぞれの正例3回と負例3回、合計12回です。手順は
 `docs/nordic_main_guide.md` の「ラベル付き6軸データ収集」を参照してください。
 
@@ -324,10 +348,10 @@ The Seeed XIAO nRF54L15 Sense board shares a single fixed regulator (`pdm_imu_pw
 This is why the `nrf54-handy/` firmware keeps `pdm_imu_pwr` ON for the entire BLE session (enabling both IMU gesture detection and PDM recording) and turns it OFF only when BLE is disconnected. By contrast, the `nordic-main/` firmware for nRF52840 Sense can toggle microphone power individually via the dedicated `msm261d3526hicpm-c-en` regulator (P1.10), achieving better battery life for gesture-triggered recording use cases.
 
 The standalone [`pdm_power_test/`](pdm_power_test/README.md) app measures whether
-stopping PDM returns current to the IMU-only baseline while keeping the
-accelerometer active at 416 Hz. It compares ordinary STOP, disconnected sleep
-pinctrl, forced-low PDM clock, and device suspend. This is an effective-sleep
-test; it does not claim that microphone VDD can be switched independently.
+the shared IMU/microphone rail and an active PDM stream create measurable current
+steps. It cycles every 20 seconds through both devices powered off, shared power
+on with the IMU powered down and microphone asleep, and the same state with the
+microphone active.
 
 For details, see `docs/nrf54_power_management.md`.
 

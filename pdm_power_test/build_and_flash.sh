@@ -5,10 +5,37 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-BUILD_DIR="${BUILD_DIR:-$HOME/pdm-power-test-build}"
 BOARD="xiao_nrf54l15/nrf54l15/cpuapp"
 NCS_BASE="/opt/nordic/ncs/v2.9.2"
 TOOLCHAIN_ROOT="/opt/nordic/ncs/toolchains"
+
+# --quiet builds the low-noise variant: no console and no printk. The LED also
+# remains off, so state boundaries must be inferred from the 20-second timer.
+QUIET=0
+for arg in "$@"; do
+	case "$arg" in
+	--quiet)
+		QUIET=1
+		;;
+	-h | --help)
+		echo "usage: $0 [--quiet]"
+		exit 0
+		;;
+	*)
+		echo "ERROR: unknown argument: $arg" >&2
+		exit 1
+		;;
+	esac
+done
+
+EXTRA_CMAKE_ARGS=()
+if [ "$QUIET" -eq 1 ]; then
+	BUILD_DIR="${BUILD_DIR:-$HOME/pdm-power-test-build-quiet}"
+	EXTRA_CMAKE_ARGS+=(-DEXTRA_CONF_FILE="$SCRIPT_DIR/prj_quiet.conf")
+	echo "Building the QUIET variant (console and printk disabled)"
+else
+	BUILD_DIR="${BUILD_DIR:-$HOME/pdm-power-test-build}"
+fi
 
 WEST=()
 if [ -x "$TOOLCHAIN_ROOT/b8efef2ad5/bin/python3" ] &&
@@ -40,7 +67,8 @@ fi
 echo "Building $BOARD -> $BUILD_DIR"
 cd "$NCS_BASE"
 "${WEST[@]}" build -p always --sysbuild -b "$BOARD" "$SCRIPT_DIR" \
-	--build-dir "$BUILD_DIR" -- -DBOARD_ROOT="$PROJECT_DIR"
+	--build-dir "$BUILD_DIR" -- -DBOARD_ROOT="$PROJECT_DIR" \
+	"${EXTRA_CMAKE_ARGS[@]+"${EXTRA_CMAKE_ARGS[@]}"}"
 
 HEX_FILE=""
 for candidate in \
@@ -62,6 +90,9 @@ if [ -n "${PYOCD:-}" ]; then
 	PYOCD_CANDIDATES=("$PYOCD")
 else
 	PYOCD_CANDIDATES=(
+		# pyOCD >= 0.37 is required: older builds have no nRF54L target.
+		# This venv is the only one on the current Mac that qualifies.
+		"$HOME/work/xiao_nrf54l15_detector/.venv/bin/pyocd"
 		"$HOME/.pyenv/shims/pyocd"
 		"/opt/homebrew/bin/pyocd"
 		"/usr/local/bin/pyocd"
@@ -88,5 +119,12 @@ echo "USB flashing $HEX_FILE with $PYOCD_CMD"
 "$PYOCD_CMD" flash -t nrf54l "$HEX_FILE"
 
 echo
-echo "Done. Serial monitor at 115200 baud:"
-echo '  screen $(ls /dev/tty.usbmodem* | head -1) 115200'
+if [ "$QUIET" -eq 1 ]; then
+	echo "Done (quiet build). There is no serial or LED state indicator."
+	echo "From reset: S0=0-20s, S1=20-40s, S2=40-60s, then repeat."
+else
+	echo "Done. Capture the run into measure.log with:"
+	echo "  cd $SCRIPT_DIR"
+	echo '  PORT=$(ls /dev/cu.usbmodem* | head -1)'
+	echo '  exec 3<"$PORT"; stty -f "$PORT" 115200 raw -echo; cat <&3 | tee measure.log'
+fi

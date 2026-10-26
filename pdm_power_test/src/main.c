@@ -3,9 +3,17 @@
  *
  * XIAO nRF54L15 Sense shared IMU/PDM rail power test.
  *
- * The microphone cannot have VDD removed independently of the IMU. This test
- * determines whether stopping its PDM clock makes its current contribution
- * disappear while the accelerometer remains active at 416 Hz.
+ * The IMU and microphone share IMU&MIC_3V3. Three 20-second states isolate
+ * the shared-rail baseline and the current added by an active PDM microphone:
+ *
+ *   S0: shared rail off; IMU off;        microphone off
+ *   S1: shared rail on;  IMU power-down; microphone asleep
+ *   S2: shared rail on;  IMU power-down; microphone active
+ *
+ * The CPU is allowed to enter System ON idle in every state. In microphone
+ * active states it wakes only to return completed PDM buffers to the slab.
+ * State markers are printed once at each transition; the onboard LED remains
+ * off because its load would contaminate the current measurement.
  */
 
 #include <errno.h>
@@ -20,14 +28,16 @@
 #include <zephyr/drivers/regulator.h>
 #include <zephyr/drivers/sensor.h>
 #include <zephyr/kernel.h>
-#include <zephyr/pm/device.h>
 
 #define LED_NODE DT_ALIAS(led0)
 #define IMU_NODE DT_ALIAS(imu0)
 #define PDM_NODE DT_NODELABEL(pdm20)
 
-#define TRANSITION_SETTLE_MS 1000
-#define MEASURE_MS 20000
+/* PDM_CLK is P1.12. Driving it low guarantees the microphone sees no clock. */
+#define PDM_CLK_PIN 12
+
+#define STATE_DURATION_MS 20000
+#define SHARED_RAIL_STARTUP_MS 10
 
 #define SAMPLE_RATE_HZ 16000
 #define SAMPLE_WIDTH_BITS 16
@@ -39,6 +49,36 @@
 
 K_MEM_SLAB_DEFINE_STATIC(pdm_slab, AUDIO_BLOCK_SIZE, AUDIO_BLOCK_COUNT, 4);
 
+enum test_state {
+	STATE_RAIL_OFF,
+	STATE_IMU_OFF_MIC_SLEEP,
+	STATE_IMU_OFF_MIC_ACTIVE,
+};
+
+struct state_desc {
+	const char *name;
+	const char *description;
+	bool mic_active;
+};
+
+static const struct state_desc states[] = {
+	[STATE_RAIL_OFF] = {
+		"S0", "shared rail off; IMU off; microphone off", false
+	},
+	[STATE_IMU_OFF_MIC_SLEEP] = {
+		"S1", "shared rail on; IMU power-down; microphone sleep", false
+	},
+	[STATE_IMU_OFF_MIC_ACTIVE] = {
+		"S2", "shared rail on; IMU power-down; microphone active", true
+	},
+};
+
+static const enum test_state cycle[] = {
+	STATE_RAIL_OFF,
+	STATE_IMU_OFF_MIC_SLEEP,
+	STATE_IMU_OFF_MIC_ACTIVE,
+};
+
 static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(LED_NODE, gpios);
 static const struct device *const imu = DEVICE_DT_GET(IMU_NODE);
 static const struct device *const dmic = DEVICE_DT_GET(PDM_NODE);
@@ -46,13 +86,15 @@ static const struct device *const shared_regulator =
 	DEVICE_DT_GET(DT_NODELABEL(pdm_imu_pwr));
 static const struct device *const gpio1 = DEVICE_DT_GET(DT_NODELABEL(gpio1));
 
-/* The driver owns this definition; NON_STATIC exposes it for this test. */
+/* The driver owns this definition; CONFIG_PINCTRL_DYNAMIC exposes it here. */
 PINCTRL_DT_DEV_CONFIG_DECLARE(PDM_NODE);
 static const struct pinctrl_dev_config *const pdm_pinctrl =
 	PINCTRL_DT_DEV_CONFIG_GET(PDM_NODE);
 
 static bool dmic_configured;
-static bool dmic_suspended;
+static bool dmic_running;
+static bool clk_forced_low;
+static bool shared_rail_enabled = true;
 static unsigned int cycle_number;
 
 static void print_result(const char *operation, int ret)
@@ -71,69 +113,52 @@ static int keep_led_off(void)
 	return gpio_pin_configure_dt(&led, GPIO_OUTPUT_INACTIVE);
 }
 
-static int configure_imu(void)
+static int power_down_imu(void)
 {
-	struct sensor_value accel_odr = { .val1 = 416, .val2 = 0 };
-	struct sensor_value gyro_off = { .val1 = 0, .val2 = 0 };
-	struct sensor_value accel_range;
+	struct sensor_value odr_off = { .val1 = 0, .val2 = 0 };
 	int ret;
 
-	sensor_g_to_ms2(2, &accel_range);
-
 	ret = sensor_attr_set(imu, SENSOR_CHAN_GYRO_XYZ,
-			      SENSOR_ATTR_SAMPLING_FREQUENCY, &gyro_off);
-	if (ret < 0) {
-		return ret;
-	}
-
-	ret = sensor_attr_set(imu, SENSOR_CHAN_ACCEL_XYZ,
-			      SENSOR_ATTR_FULL_SCALE, &accel_range);
+			      SENSOR_ATTR_SAMPLING_FREQUENCY, &odr_off);
 	if (ret < 0) {
 		return ret;
 	}
 
 	return sensor_attr_set(imu, SENSOR_CHAN_ACCEL_XYZ,
-			       SENSOR_ATTR_SAMPLING_FREQUENCY, &accel_odr);
+			       SENSOR_ATTR_SAMPLING_FREQUENCY, &odr_off);
 }
 
-static void print_acceleration(const char *state)
+static int enable_shared_rail(void)
 {
-	struct sensor_value x;
-	struct sensor_value y;
-	struct sensor_value z;
 	int ret;
 
-	ret = sensor_sample_fetch_chan(imu, SENSOR_CHAN_ACCEL_XYZ);
-	if (ret == 0) {
-		ret = sensor_channel_get(imu, SENSOR_CHAN_ACCEL_X, &x);
-	}
-	if (ret == 0) {
-		ret = sensor_channel_get(imu, SENSOR_CHAN_ACCEL_Y, &y);
-	}
-	if (ret == 0) {
-		ret = sensor_channel_get(imu, SENSOR_CHAN_ACCEL_Z, &z);
+	if (shared_rail_enabled) {
+		return 0;
 	}
 
-	if (ret < 0) {
-		printk("!!! %s IMU proof FAILED: %d\n", state, ret);
-		return;
+	ret = regulator_enable(shared_regulator);
+	if (ret < 0 && ret != -EALREADY) {
+		return ret;
 	}
-
-	printk(">>> %s IMU proof: x=%.3f y=%.3f z=%.3f m/s^2\n",
-	       state, sensor_value_to_double(&x), sensor_value_to_double(&y),
-	       sensor_value_to_double(&z));
+	shared_rail_enabled = true;
+	k_msleep(SHARED_RAIL_STARTUP_MS);
+	return 0;
 }
 
-static void run_quiet_state(const char *state, const char *description,
-			    bool prove_imu)
+static int disable_shared_rail(void)
 {
-	printk(">>> STATE %s: %s\n", state, description);
-	k_msleep(TRANSITION_SETTLE_MS);
-	printk(">>> MEASURE %s: 20 seconds\n", state);
-	if (prove_imu) {
-		print_acceleration(state);
+	int ret;
+
+	if (!shared_rail_enabled) {
+		return 0;
 	}
-	k_msleep(MEASURE_MS);
+
+	ret = regulator_disable(shared_regulator);
+	if (ret < 0 && ret != -EALREADY) {
+		return ret;
+	}
+	shared_rail_enabled = false;
+	return 0;
 }
 
 static int configure_dmic_once(void)
@@ -176,7 +201,7 @@ static void free_queued_audio(void)
 {
 	while (true) {
 		void *block = NULL;
-		size_t size;
+		uint32_t size;
 		int ret = dmic_read(dmic, 0, &block, &size, 0);
 
 		if (ret < 0) {
@@ -188,127 +213,171 @@ static void free_queued_audio(void)
 	}
 }
 
-static int prepare_dmic_default(void)
-{
-	int ret;
-
-	if (dmic_suspended) {
-		ret = pm_device_action_run(dmic, PM_DEVICE_ACTION_RESUME);
-		if (ret < 0) {
-			return ret;
-		}
-		dmic_suspended = false;
-	}
-
-	return pinctrl_apply_state(pdm_pinctrl, PINCTRL_STATE_DEFAULT);
-}
-
-static void run_s2_recording(void)
-{
-	int64_t started;
-	bool measurement_started = false;
-	int ret;
-
-	ret = prepare_dmic_default();
-	print_result("PDM default pinctrl", ret);
-	if (ret < 0) {
-		return;
-	}
-
-	ret = configure_dmic_once();
-	print_result("DMIC configure", ret);
-	if (ret < 0) {
-		return;
-	}
-
-	ret = dmic_trigger(dmic, DMIC_TRIGGER_START);
-	print_result("DMIC start", ret);
-	if (ret < 0) {
-		return;
-	}
-
-	printk(">>> STATE S2: IMU 416 Hz + PDM recording\n");
-	started = k_uptime_get();
-
-	while ((k_uptime_get() - started) <
-	       (TRANSITION_SETTLE_MS + MEASURE_MS)) {
-		void *block = NULL;
-		size_t size;
-
-		ret = dmic_read(dmic, 0, &block, &size, 100);
-		if (ret == 0 && block != NULL) {
-			k_mem_slab_free(&pdm_slab, block);
-		}
-
-		if (!measurement_started &&
-		    (k_uptime_get() - started) >= TRANSITION_SETTLE_MS) {
-			measurement_started = true;
-			printk(">>> MEASURE S2: 20 seconds\n");
-			print_acceleration("S2");
-		}
-	}
-}
-
 static int stop_dmic(void)
 {
-	int ret = dmic_trigger(dmic, DMIC_TRIGGER_STOP);
+	int ret;
 
+	if (!dmic_running) {
+		return 0;
+	}
+
+	ret = dmic_trigger(dmic, DMIC_TRIGGER_STOP);
 	if (ret < 0) {
 		return ret;
 	}
+	dmic_running = false;
 
-	/* STOP is asynchronous; let the final release event complete. */
+	/* STOP is asynchronous; allow its final buffer release to complete. */
 	k_msleep(100);
 	free_queued_audio();
 	return 0;
 }
 
-static void enter_s0(void)
+static int restore_pdm_pins(void)
 {
-	int ret = regulator_disable(shared_regulator);
+	int ret;
 
-	if (ret < 0 && ret != -EALREADY) {
-		print_result("shared rail off", ret);
+	if (clk_forced_low) {
+		ret = gpio_pin_configure(gpio1, PDM_CLK_PIN, GPIO_DISCONNECTED);
+		if (ret < 0) {
+			return ret;
+		}
+		clk_forced_low = false;
 	}
-	run_quiet_state("S0", "shared rail OFF; IMU and microphone OFF", false);
+
+	return pinctrl_apply_state(pdm_pinctrl, PINCTRL_STATE_DEFAULT);
 }
 
-static bool enter_s1(void)
+static int start_dmic(void)
 {
-	int ret = regulator_enable(shared_regulator);
+	int ret;
 
-	if (ret < 0 && ret != -EALREADY) {
-		print_result("shared rail on", ret);
-		return false;
+	if (dmic_running) {
+		return 0;
 	}
-	k_msleep(10);
 
-	ret = configure_imu();
-	print_result("IMU configure (accel 416 Hz, gyro off)", ret);
+	ret = restore_pdm_pins();
 	if (ret < 0) {
-		return false;
+		return ret;
 	}
 
-	if (cycle_number == 1U) {
-		run_quiet_state("S1",
-				"IMU 416 Hz; PDM never configured (target baseline)",
-				true);
-	} else {
-		run_quiet_state("S1",
-				"IMU 416 Hz; PDM previously configured but stopped",
-				true);
+	ret = configure_dmic_once();
+	if (ret < 0) {
+		return ret;
 	}
-	return true;
+
+	ret = dmic_trigger(dmic, DMIC_TRIGGER_START);
+	if (ret == 0) {
+		dmic_running = true;
+	}
+	return ret;
+}
+
+static void sleep_dmic(void)
+{
+	int ret;
+
+	print_result("DMIC stop", stop_dmic());
+	print_result("PDM sleep pinctrl",
+		     pinctrl_apply_state(pdm_pinctrl, PINCTRL_STATE_SLEEP));
+
+	ret = gpio_pin_configure(gpio1, PDM_CLK_PIN, GPIO_OUTPUT_LOW);
+	print_result("PDM_CLK GPIO low", ret);
+	if (ret == 0) {
+		clk_forced_low = true;
+	}
+}
+
+static void enter_state(enum test_state state)
+{
+	int ret;
+
+	switch (state) {
+	case STATE_RAIL_OFF:
+		sleep_dmic();
+		if (shared_rail_enabled) {
+			print_result("IMU power-down", power_down_imu());
+		}
+		print_result("shared rail off", disable_shared_rail());
+		break;
+
+	case STATE_IMU_OFF_MIC_SLEEP:
+		ret = enable_shared_rail();
+		print_result("shared rail on", ret);
+		if (ret == 0) {
+			print_result("IMU power-down", power_down_imu());
+		}
+		sleep_dmic();
+		break;
+
+	case STATE_IMU_OFF_MIC_ACTIVE:
+		ret = enable_shared_rail();
+		print_result("shared rail on", ret);
+		if (ret != 0) {
+			break;
+		}
+		print_result("IMU power-down", power_down_imu());
+		print_result("DMIC start", start_dmic());
+		break;
+	}
+}
+
+static void hold_state(enum test_state state, int64_t deadline_ms)
+{
+	if (!states[state].mic_active) {
+		int64_t remaining_ms = deadline_ms - k_uptime_get();
+
+		if (remaining_ms > 0) {
+			k_msleep(remaining_ms);
+		}
+		return;
+	}
+
+	while (k_uptime_get() < deadline_ms) {
+		void *block = NULL;
+		uint32_t size;
+		int64_t remaining_ms = deadline_ms - k_uptime_get();
+		int32_t timeout_ms = (int32_t)MIN(remaining_ms, 100);
+
+		if (timeout_ms <= 0) {
+			break;
+		}
+		if (dmic_read(dmic, 0, &block, &size, timeout_ms) == 0 &&
+		    block != NULL) {
+			k_mem_slab_free(&pdm_slab, block);
+		}
+	}
+}
+
+static void run_state(enum test_state state, int64_t deadline_ms)
+{
+	const struct state_desc *desc = &states[state];
+
+	printk(">>> STATE %s: %s; duration=%d ms\n", desc->name,
+	       desc->description, STATE_DURATION_MS);
+	enter_state(state);
+	printk(">>> MEASURE %s: until uptime %lld ms\n", desc->name,
+	       (long long)deadline_ms);
+
+	hold_state(state, deadline_ms);
+	if (k_uptime_get() > deadline_ms + 10) {
+		printk("!!! %s transition deadline missed by %lld ms\n", desc->name,
+		       (long long)(k_uptime_get() - deadline_ms));
+	}
 }
 
 int main(void)
 {
-	int ret;
+	int64_t next_transition_ms;
 
 	printk("\n============================================\n");
 	printk("pdm_power_test: XIAO nRF54L15 Sense\n");
-	printk("Mic VDD is shared with IMU; testing effective sleep\n");
+	printk("Shared rail baseline test; LED stays off\n");
 	printk("Build: %s %s\n", __DATE__, __TIME__);
+	printk("Cycle: S0(rail off) S1(IMU off/mic sleep) "
+	       "S2(IMU off/mic active)\n");
+	printk("State duration: %d ms; cycle duration: %d ms\n",
+	       STATE_DURATION_MS, STATE_DURATION_MS * ARRAY_SIZE(cycle));
 	printk("============================================\n");
 
 	print_result("LED off", keep_led_off());
@@ -321,38 +390,21 @@ int main(void)
 		return 0;
 	}
 
+	/* regulator-boot-on already owns the initial reference. Do not call
+	 * regulator_enable() here: S0 must release that single reference so the
+	 * fixed regulator driver actually drives P0.01 low.
+	 */
+	shared_rail_enabled = true;
+
+	next_transition_ms = k_uptime_get();
 	while (true) {
 		cycle_number++;
-		printk("\n>>> CYCLE %u START\n", cycle_number);
+		printk("\n>>> CYCLE %u START (60 seconds)\n", cycle_number);
 
-		enter_s0();
-		if (!enter_s1()) {
-			printk("!!! Cycle aborted because IMU baseline is unavailable\n");
-			k_msleep(5000);
-			continue;
+		for (size_t i = 0; i < ARRAY_SIZE(cycle); i++) {
+			next_transition_ms += STATE_DURATION_MS;
+			run_state(cycle[i], next_transition_ms);
 		}
-
-		run_s2_recording();
-
-		ret = stop_dmic();
-		print_result("DMIC stop", ret);
-		run_quiet_state("S3", "PDM stopped only", true);
-
-		ret = pinctrl_apply_state(pdm_pinctrl, PINCTRL_STATE_SLEEP);
-		print_result("PDM sleep pinctrl", ret);
-		run_quiet_state("S3D", "PDM stopped; CLK and DIN disconnected", true);
-
-		ret = gpio_pin_configure(gpio1, 12, GPIO_OUTPUT_LOW);
-		print_result("P1.12 GPIO low", ret);
-		run_quiet_state("S4", "PDM stopped; PDM_CLK forced GPIO low", true);
-
-		ret = pm_device_action_run(dmic, PM_DEVICE_ACTION_SUSPEND);
-		printk(">>> S5 suspend result: %d%s\n", ret,
-		       ret == -ENOSYS ? " (DMIC driver has no device PM callback)" : "");
-		if (ret == 0) {
-			dmic_suspended = true;
-		}
-		run_quiet_state("S5", "S4 plus DMIC device suspend attempt", true);
 	}
 
 	return 0;

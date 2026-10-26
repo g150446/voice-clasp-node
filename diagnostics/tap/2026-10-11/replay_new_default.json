@@ -1,0 +1,22 @@
+{
+  "harness_tap_0111_45deg_double_1.json": [
+    "double"
+  ],
+  "harness_tap_0111_45deg_double_100ms_1.json": [
+    "double"
+  ],
+  "harness_tap_0111_45deg_double_60ms_1.json": [
+    "double"
+  ],
+  "harness_tap_0111_45deg_motion_100ms_1.json": [],
+  "harness_tap_0111_45deg_single_1.json": [
+    "single"
+  ],
+  "harness_tap_0111_double_2.json": [
+    "double"
+  ],
+  "harness_tap_0111_motion_1.json": [],
+  "harness_tap_0111_single_1.json": [
+    "single"
+  ]
+}

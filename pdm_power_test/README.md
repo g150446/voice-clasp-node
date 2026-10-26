@@ -1,90 +1,75 @@
 # XIAO nRF54L15 Sense PDM省電力検証
 
-XIAO nRF54L15 Senseで、LSM6DS3TR-C加速度センサーを416 Hzで動かしたまま、
-オンボードPDMマイクの消費電流をクロック停止によって下げられるか確認するための
-単独ファームウェアです。既存の`nordic-main/`、`nrf54-handy/`は変更しません。
+XIAO nRF54L15 Senseの共有IMU/マイク電源と、PDMマイクをactiveにしたときの
+消費電流を分離して測定する単独ファームウェアです。
 
-## 何を判定するテストか
+IMUとマイクはTPS22916Cロードスイッチ配下の`IMU&MIC_3V3`を共有しています。
+S0ではロードスイッチ自体をOFFにし、S1/S2では共有電源をONにしたままIMUの
+加速度・ジャイロをpower-downへ設定します。
 
-IMUとマイクのVDDは`IMU&MIC_3V3`として共有されているため、IMUを動かしたまま
-マイクの物理電源だけを切ることはできません。このテストで確認する「マイクOFF」は、
-VDDを残したままPDMクロックを止め、マイクの消費電流がIMUのみの基準値まで戻る
-**実質的なスリープ**を意味します。
+## 3つの状態
 
-判定には必ず電流値とシリアルの`IMU proof`を組み合わせます。電流が下がっても
-IMU値が読めなければ成功ではありません。
+次の状態を20秒ごとに切り替えます。1周は60秒です。
 
-## 状態シーケンス
+| 状態 | 共有電源 | IMU | マイク | CPU |
+| --- | --- | --- | --- | --- |
+| S0 | OFF | 完全OFF | 完全OFF | System ON idle |
+| S1 | ON | 加速度・ジャイロODR 0 | STOP、CLK Low | System ON idle |
+| S2 | ON | 加速度・ジャイロODR 0 | 16 kHz active | PDM処理時だけ起床 |
 
-各状態は遷移後1秒待ってから20秒間継続します。1周は約147秒です。
+比較の意味は次のとおりです。
 
-| 状態 | 内容 | 判定上の役割 |
-| --- | --- | --- |
-| S0 | 共有レールOFF | IMU・マイクともOFFの参考値 |
-| S1 | 共有レールON、加速度416 Hz、ジャイロOFF | IMUのみの目標基準値。初周ではDMIC未設定 |
-| S2 | S1 + PDM録音 | マイク動作時の比較値 |
-| S3 | S2から`DMIC_TRIGGER_STOP` | STOPだけでスリープするか |
-| S3D | S3 + sleep pinctrlでCLK/DIN切断 | pinctrl sleepの効果 |
-| S4 | S3D + P1.12をGPIO Low固定 | CLKを確実にLowにした効果 |
-| S5 | S4 + DMIC device suspend試行 | デバイスPMの追加効果 |
+- `S1 - S0`: 共有電源をONにしたときのロードスイッチ、power-down中のIMU、
+  sleep中のマイクなどの合計
+- `S2 - S1`: マイクactive、nRF54 PDM peripheral、クロック、DMA処理の増分
 
-LEDとBLEは全状態で無効です。S1以降は各状態で一度、加速度値を表示します。
+S0へ入るときはDMICを停止して残りのバッファを解放し、PDMピンを切断して
+CLKをLowへ固定してからIMUをpower-downにし、最後に共有電源をOFFにします。
+S1へ入るときは共有電源を再投入して10 ms待ってから、IMUの両ODRを0へ設定します。
+
+各状態は遷移処理を含めて20秒です。絶対deadlineで管理するため、設定処理時間による
+周期のずれは蓄積しません。
+
+## CPUと状態表示
+
+ここでのCPU sleepは復帰可能なSystem ON idleです。S0/S1では20秒タイマーまで
+sleepし、S2ではPDMバッファ割り込み時だけ短時間起床します。System OFFはタイマー
+復帰やPDM連続動作と両立しないため使用しません。
+
+オンボードLEDは測定電流へ影響させないため全状態で消灯します。通常版ではUARTへ
+次の状態表示を出します。
+
+```text
+>>> STATE S0: shared rail off; IMU off; microphone off; duration=20000 ms
+>>> STATE S1: shared rail on; IMU power-down; microphone sleep; duration=20000 ms
+>>> STATE S2: shared rail on; IMU power-down; microphone active; duration=20000 ms
+```
 
 ## ビルドと書き込み
 
-前提はNCS v2.9.2とnRF54L対応のpyOCD 0.37.0以降です。
+NCS v2.9.2とnRF54L対応のpyOCD 0.37.0以降を使用します。
 
 ```bash
 cd pdm_power_test
 ./build_and_flash.sh
 ```
 
-pyOCDを明示する場合:
+ボードは`xiao_nrf54l15/nrf54l15/cpuapp`、ビルドはsysbuildです。UARTは
+115200 baudで、タイムスタンプ付きログは`python3 capture.py`で取得できます。
+
+### 静音ビルド
 
 ```bash
-PYOCD=/path/to/pyocd ./build_and_flash.sh
+./build_and_flash.sh --quiet
 ```
 
-ボードターゲットは`xiao_nrf54l15/nrf54l15/cpuapp`、ビルドはsysbuildを使用します。
-シリアルは115200 baudです。
-
-```bash
-screen /dev/tty.usbmodemXXXXXXXXX 115200
-```
+静音版はUARTを無効にし、LEDも消灯します。リセット後のS0=0〜20秒、
+S1=20〜40秒、S2=40〜60秒という周期から状態を特定できる場合だけ使用します。
 
 ## 判定
 
-最初に`S2 > S1`であることを確認します。差が見えなければ測定器の分解能不足で、
-以降の比較から結論を出せません。
+UT70の表示が0.001 A刻みの場合、1 mAの差は1カウントしかないため、複数周で
+同じ段差が再現するか確認します。これはUSB 5 V入力で見た基板全体の電流であり、
+各デバイス単体の電流ではありません。
 
-| 観測 | 結論 | 本番コードへの反映候補 |
-| --- | --- | --- |
-| S3 ≈ S1、IMU proof成功 | STOPだけでマイクは実質スリープ | `DMIC_TRIGGER_STOP` |
-| S3 > S1、S3D ≈ S1 | sleep pinctrlが必要 | sleep stateを適用 |
-| S3D > S1、S4 ≈ S1 | CLKのLow固定が必要 | P1.12をGPIO Lowへ切り替え |
-| S4 > S1、S5 ≈ S1 | device suspendが必要 | `CONFIG_PM_DEVICE` + suspend |
-| S3〜S5がS2相当 | クロック停止で十分な低下を確認できない | ハードウェア構成を再検討 |
-| 全状態差が100 µA未満 | 測定系が不十分 | 分解能の高い機材で再測定 |
-
-結論は「マイクのVDDをOFFにできた」ではなく、次のどちらかで記録します。
-
-- マイクVDDはONだが、消費電流はIMUのみのS1基準まで戻った。
-- クロックを停止しても消費電流はS1基準まで戻らなかった。
-
-接続方法、安価なUSB電流計を含む測定器別手順、記録表は
-[MEASURE.md](MEASURE.md)を参照してください。
-
-## 現在の確認状況
-
-2026-08-31にNCS v2.9.2でビルドと実機書き込みを行い、S2からS3へ遷移しても
-416 Hz設定のIMU値を取得できることを確認済みです。電流値は未測定のため、
-マイクが実質スリープするかの最終結論はまだ出していません。
-
-## マイク仕様の扱い
-
-メーカーの[製品一覧](https://en.memsensing.com/product/176.html)には実装品
-`MSM261DGT006`が掲載されていますが、公開ページにスリープ電流はありません。
-関連品`MSM261DGT003`の
-[メーカー作成データシート](https://dfimg.dfrobot.com/5d57611a3416442fa39bffca/wiki/d2c58ceeebf0ab6a527b0c37c0ef525e.pdf)
-には、50 kHz以下でtyp. 1 µA、スリープ移行最大30 µsと記載されています。
-これは`MSM261DGT006`の保証値ではなく、この実測で確認する仮説として扱います。
+詳しい手順と記録表は[`MEASURE.md`](MEASURE.md)を参照してください。

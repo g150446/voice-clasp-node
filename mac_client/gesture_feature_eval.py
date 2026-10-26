@@ -16,7 +16,10 @@ from __future__ import annotations
 import argparse
 import math
 import random
+from pathlib import Path
 from typing import Any, Callable, Iterable
+
+from imu_trajectory import load_android_trajectory_csv
 
 G = 9.80665
 DEG = 180.0 / math.pi
@@ -30,6 +33,20 @@ LIFT_POS_IMPULSE_MIN_MS = 0.30    # :269
 LIFT_NEG_IMPULSE_MIN_MS = 0.015   # :274
 LIFT_CONSECUTIVE_SAMPLES = 2      # :277
 MATCH_POS_IMPULSE_MIN_MS = 0.65   # :272
+FINAL_RMS_WINDOW_SAMPLES = 4
+FINAL_STILL_RMS_MS2 = 3.0
+FINAL_QUIET_RATE_DPS = 90.0
+HOLD_GYRO_MIN_RATE_DPS = 10.0
+HOLD_GYRO_ANGLE_MIN_DEG = 30.0
+HOLD_GYRO_XY_RATIO_MIN = 0.42
+LIFT_PREFLIP_MAX_DEG = 50.0
+LIFT_PULSE_MIN_MS = 150
+LIFT_BRAKE_RATIO_MIN = 0.05
+PRONATION_MIN_DEG = 15.0
+PRONATION_Z_RATIO_DONE = 0.40
+PRONATION_Z_SIGN_MIN_MS2 = 2.0
+START_QUIET_ACCEL_MS2 = 4.0
+PALM_UP_DWELL_TILT_MAX_DEG = 20.0
 
 # --- gyro-propagated estimator ---
 GYRO_CORRECT_TAU_S = 2.0
@@ -283,6 +300,256 @@ def evaluate(samples: list, estimator, dt_s: float) -> dict:
     return out
 
 
+def _sample_vectors(sample: dict) -> tuple[tuple, tuple]:
+    accel = tuple(sample[k] for k in ("ax_ms2", "ay_ms2", "az_ms2"))
+    gyro = tuple((sample.get(k) or 0.0) for k in ("gx_dps", "gy_dps", "gz_dps"))
+    return accel, gyro
+
+
+def _sample_dt(samples: list[dict], index: int) -> float:
+    if index == 0:
+        return SAMPLE_INTERVAL_MS / 1000.0
+    dt_s = (samples[index]["elapsed_ms"] - samples[index - 1]["elapsed_ms"]) / 1000.0
+    return dt_s if 0.0 < dt_s <= 0.1 else SAMPLE_INTERVAL_MS / 1000.0
+
+
+def _angle_deg(a: tuple, b: tuple) -> float:
+    denom = _norm(a) * _norm(b)
+    if denom <= 0.01:
+        return 180.0
+    cosine = max(-1.0, min(1.0, sum(a[i] * b[i] for i in range(3)) / denom))
+    return math.acos(cosine) * DEG
+
+
+def _deg_diff(a: float, b: float) -> float:
+    delta = a - b
+    while delta > 180.0:
+        delta -= 360.0
+    while delta < -180.0:
+        delta += 360.0
+    return delta
+
+
+def replay_firmware_window(trajectory: dict[str, Any]) -> dict[str, Any]:
+    """Replay the firmware through entry into WAIT_HOLD.
+
+    ``gesture_lift_pos_impulse_ms`` stops changing at that transition.  This is
+    the value later emitted as both ``final_hold_start.v1`` and ``match.v2``;
+    deliberately continuing through the 500 ms hold recreates the old, invalid
+    analysis window.
+    """
+    samples = trajectory["samples"]
+    powered_index = next(
+        (i for i, sample in enumerate(samples) if sample["gyro_powered"]), None
+    )
+    if powered_index is None or powered_index == 0:
+        raise ValueError("trajectory has no palm-up dwell / gyro transition")
+
+    gravity = LpfGravity()
+    for index in range(powered_index):
+        accel, gyro = _sample_vectors(samples[index])
+        gravity.update(accel, gyro, _sample_dt(samples, index))
+    armed_g = gravity.g
+    armed_norm = _norm(armed_g)
+    armed_z_ratio = armed_g[2] / armed_norm
+    ref_phi = math.atan2(-armed_g[0], armed_g[2]) * DEG
+    gyro_bias = float(trajectory.get("meta", {}).get("gyro_bias_y", 0.0))
+
+    stage = "WAIT_ACCEL"
+    pos_imp = 0.0
+    neg_imp = 0.0
+    peak_a_up = 0.0
+    event_start_ms = None
+    accel_samples = 0
+    brake_samples = 0
+    roll_deg = 0.0
+    gyro_y_peak = 0.0
+    gyro_x_peak = 0.0
+    pronation_phi = 0.0
+    palm_down_latched = False
+    lift_before_flip = False
+    impulse_at_entry = 0.0
+    settle_window: list[float] = []
+
+    for index in range(powered_index, len(samples)):
+        sample = samples[index]
+        accel, gyro = _sample_vectors(sample)
+        dt_s = _sample_dt(samples, index)
+        a_up = gravity.update(accel, gyro, dt_s)
+        linear_norm = _norm(tuple(accel[i] - gravity.g[i] for i in range(3)))
+        gyro_ok = sample["gyro_read_valid"] and sample["gyro_settled"]
+        gy = gyro[1] - gyro_bias
+        if gyro_ok:
+            gyro_y_peak = max(gyro_y_peak, abs(gy))
+            gyro_x_peak = max(gyro_x_peak, abs(gyro[0]))
+            if abs(gy) >= HOLD_GYRO_MIN_RATE_DPS:
+                roll_deg += gy * dt_s
+
+        phi = math.atan2(-accel[0], accel[2]) * DEG
+        pronation_phi = max(pronation_phi, abs(_deg_diff(phi, ref_phi)))
+        accel_norm = _norm(accel)
+        z_ratio = accel[2] / accel_norm if accel_norm > 0.1 else 0.0
+        gravity_ok = (
+            pronation_phi >= PRONATION_MIN_DEG
+            or abs(z_ratio - armed_z_ratio) >= PRONATION_Z_RATIO_DONE
+            or (
+                accel[2] * armed_g[2] < 0.0
+                and abs(accel[2]) >= PRONATION_Z_SIGN_MIN_MS2
+                and abs(armed_g[2]) >= PRONATION_Z_SIGN_MIN_MS2
+            )
+        )
+        xy_ok = gyro_y_peak > 0.1 and gyro_x_peak / gyro_y_peak >= HOLD_GYRO_XY_RATIO_MIN
+        lift_waives_xy = (
+            stage != "WAIT_ACCEL"
+            and lift_before_flip
+            and impulse_at_entry >= LIFT_POS_IMPULSE_MIN_MS
+        )
+        if gravity_ok and abs(roll_deg) >= HOLD_GYRO_ANGLE_MIN_DEG and (xy_ok or lift_waives_xy):
+            palm_down_latched = True
+
+        now_ms = sample["elapsed_ms"]
+        if stage == "WAIT_ACCEL":
+            peak_a_up = max(peak_a_up, a_up)
+            if a_up >= LIFT_ACCEL_MIN_MS2:
+                if event_start_ms is None:
+                    event_start_ms = now_ms
+                accel_samples += 1
+                pos_imp += a_up * dt_s
+            elif event_start_ms is not None and a_up > 0.0:
+                pos_imp += a_up * dt_s
+                accel_samples = 0
+            elif a_up <= 0.0:
+                event_start_ms = None
+                accel_samples = 0
+                pos_imp = 0.0
+                peak_a_up = 0.0
+            else:
+                accel_samples = 0
+            if accel_samples >= LIFT_CONSECUTIVE_SAMPLES and pos_imp >= LIFT_POS_IMPULSE_MIN_MS:
+                impulse_at_entry = pos_imp
+                lift_before_flip = abs(roll_deg) < LIFT_PREFLIP_MAX_DEG
+                stage = "WAIT_BRAKE"
+                brake_samples = 0
+        elif stage == "WAIT_BRAKE":
+            if a_up > 0.0:
+                pos_imp += a_up * dt_s
+            else:
+                neg_imp += -a_up * dt_s
+            if a_up <= -LIFT_BRAKE_MIN_MS2:
+                brake_samples = min(brake_samples + 1, LIFT_CONSECUTIVE_SAMPLES)
+            elif brake_samples < LIFT_CONSECUTIVE_SAMPLES:
+                brake_samples = 0
+
+            pulse_ms = now_ms - event_start_ms
+            brake_ready = (
+                brake_samples >= LIFT_CONSECUTIVE_SAMPLES
+                and neg_imp >= LIFT_NEG_IMPULSE_MIN_MS
+            )
+            gyro_quiet = not gyro_ok or abs(gy) <= FINAL_QUIET_RATE_DPS
+            if pulse_ms >= LIFT_PULSE_MIN_MS and palm_down_latched and gyro_quiet:
+                settle_window.append(linear_norm)
+                settle_window = settle_window[-FINAL_RMS_WINDOW_SAMPLES:]
+            else:
+                settle_window.clear()
+            settled = (
+                len(settle_window) == FINAL_RMS_WINDOW_SAMPLES
+                and math.sqrt(sum(v * v for v in settle_window) / len(settle_window))
+                <= FINAL_STILL_RMS_MS2
+            )
+            brake_ratio = neg_imp / pos_imp if pos_imp > 0.0 else 0.0
+            if (
+                (brake_ready and pulse_ms >= LIFT_PULSE_MIN_MS and brake_ratio >= LIFT_BRAKE_RATIO_MIN)
+                or settled
+            ):
+                return {
+                    "pos_impulse": pos_imp,
+                    "hold_entry_ms": now_ms,
+                    "impulse_at_lift": impulse_at_entry,
+                    "pronation_phi": pronation_phi,
+                }
+    raise ValueError("trajectory never entered final hold")
+
+
+def _live_value(trajectory: dict[str, Any], stage: int, field: str) -> float:
+    matches = [diag for diag in trajectory.get("live", []) if diag["stage"] == stage]
+    if not matches:
+        raise ValueError(f"live diagnostics do not contain stage 0x{stage:02X}")
+    return float(matches[-1][field])
+
+
+def cmd_verify_window(args) -> int:
+    failed = False
+    print("file                                      offline   FW match   error")
+    for raw_path in args.csv:
+        path = Path(raw_path)
+        try:
+            trajectory = load_android_trajectory_csv(path)
+            offline = replay_firmware_window(trajectory)["pos_impulse"]
+            expected = _live_value(trajectory, 0x09, "v2")
+            relative = abs(offline - expected) / max(abs(expected), 1e-9)
+            ok = relative <= args.tolerance_percent / 100.0
+            failed = failed or not ok
+            print(
+                f"{path.name:40s} {offline:8.4f} {expected:10.4f} "
+                f"{relative * 100:6.2f}% {'PASS' if ok else 'FAIL'}"
+            )
+        except (OSError, ValueError, KeyError) as error:
+            failed = True
+            print(f"{path.name:40s} ERROR: {error}")
+    return 1 if failed else 0
+
+
+def simulate_dwell_limit(trajectory: dict[str, Any], limit_ms: int) -> tuple[bool, int | None]:
+    samples = trajectory["samples"]
+    gravity = LpfGravity()
+    candidate_g = None
+    rms_window: list[float] = []
+    for index, sample in enumerate(samples):
+        accel, gyro = _sample_vectors(sample)
+        gravity.update(accel, gyro, _sample_dt(samples, index))
+        if candidate_g is None:
+            candidate_g = gravity.g
+        linear_norm = _norm(tuple(accel[i] - gravity.g[i] for i in range(3)))
+        rms_window.append(linear_norm)
+        rms_window = rms_window[-FINAL_RMS_WINDOW_SAMPLES:]
+        rms = math.sqrt(sum(v * v for v in rms_window) / len(rms_window))
+        tilt = _angle_deg(gravity.g, candidate_g)
+        t_ms = sample["elapsed_ms"]
+        if rms > START_QUIET_ACCEL_MS2 or tilt > PALM_UP_DWELL_TILT_MAX_DEG:
+            return t_ms >= limit_ms, t_ms
+        if t_ms >= limit_ms:
+            return True, None
+    return False, samples[-1]["elapsed_ms"] if samples else None
+
+
+def cmd_dwell_sweep(args) -> int:
+    limit_tokens = []
+    csv_paths = list(args.csv)
+    for token in args.limits:
+        try:
+            limit_tokens.append(int(token))
+        except ValueError:
+            csv_paths.append(token)
+    if not limit_tokens or not csv_paths:
+        raise ValueError("dwell-sweep needs integer limits followed by one or more CSVs")
+    header = "file".ljust(40) + " " + " ".join(f"{limit:>9d}ms" for limit in limit_tokens)
+    print(header)
+    failed = False
+    for raw_path in csv_paths:
+        path = Path(raw_path)
+        try:
+            trajectory = load_android_trajectory_csv(path)
+            cells = []
+            for limit in limit_tokens:
+                passed, break_ms = simulate_dwell_limit(trajectory, limit)
+                cells.append("PASS" if passed else f"BREAK {break_ms}")
+            print(path.name.ljust(40) + " " + " ".join(f"{cell:>11s}" for cell in cells))
+        except (OSError, ValueError, KeyError) as error:
+            failed = True
+            print(f"{path.name:40s} ERROR: {error}")
+    return 1 if failed else 0
+
+
 def _report(title: str, rows: list) -> None:
     print(f"\n{title}")
     print(
@@ -395,6 +662,25 @@ def main() -> int:
         help="repeatable: constant gyro bias and white noise sigma, in dps",
     )
     p.set_defaults(func=cmd_synthetic_rotation)
+
+    p = sub.add_parser(
+        "verify-window",
+        help="replay raw Android CSVs and compare hold-entry impulse with FW match v2",
+    )
+    p.add_argument("csv", nargs="+", help="Android trajectory CSV")
+    p.add_argument("--tolerance-percent", type=float, default=5.0)
+    p.set_defaults(func=cmd_verify_window)
+
+    p = sub.add_parser(
+        "dwell-sweep",
+        help="simulate longer palm-up dwell requirements on raw Android CSVs",
+    )
+    # Keep the documented ``--limits 500 800 ... file.csv`` spelling. argparse
+    # cannot otherwise know where a variable integer option ends, so command
+    # handling splits the first non-integer token into the CSV list.
+    p.add_argument("--limits", nargs="+", required=True)
+    p.add_argument("csv", nargs="*", help="labelled Android trajectory CSV")
+    p.set_defaults(func=cmd_dwell_sweep)
 
     args = parser.parse_args()
     if getattr(args, "gyro_error", None) is None:

@@ -15,11 +15,13 @@ gesture_monitor.py — BLE接続して IMU イベントを表示する
   0xD1  imu_int_fired    GPIO割り込み発火（WAKE_UP_SRC）
 """
 
+from device_debug import DebugControl
 import asyncio
 import struct
 import sys
 from datetime import datetime
 from bleak import BleakClient, BleakScanner
+from node_names import find_node
 
 DEVICE_NAME   = "HarnessNode"
 AUDIO_TX_UUID = "00000002-0000-1000-8000-00805f9b34fb"
@@ -71,7 +73,7 @@ def on_notify(sender, data: bytes):
 
 async def main():
     print(f"Scanning for '{DEVICE_NAME}'...")
-    device = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=10)
+    device = await find_node(DEVICE_NAME, timeout=10)
     if device is None:
         print(f"Device '{DEVICE_NAME}' not found.")
         sys.exit(1)
@@ -79,12 +81,14 @@ async def main():
     print(f"Found: {device.address}. Connecting...")
     async with BleakClient(device) as client:
         print("Connected.\n")
-        await client.start_notify(AUDIO_TX_UUID, on_notify)
-        try:
-            while client.is_connected:
-                await asyncio.sleep(0.1)
-        except KeyboardInterrupt:
-            pass
+        debug = DebugControl()
+        await client.start_notify(AUDIO_TX_UUID, debug.wrap(on_notify))
+        async with debug.session(client):
+            try:
+                while client.is_connected:
+                    await asyncio.sleep(0.1)
+            except KeyboardInterrupt:
+                pass
     print("Disconnected.")
 
 

@@ -14,8 +14,9 @@ import time
 
 import cbor2
 from bleak import BleakClient, BleakScanner
+from node_names import NODE_NAME, find_node
 
-DEVICE_NAME = "HarnessNode"   # default; override with --device flag
+DEVICE_NAME = NODE_NAME   # default (either brand name is accepted); override with --device flag
 
 # SMP BLE service / characteristic UUIDs
 SMP_SERVICE_UUID   = "8D53DC1D-1DB7-4CD3-868B-8A527460AA84"
@@ -93,7 +94,7 @@ class SMPClient:
 
 async def find_device(name: str, timeout: float = 15.0):
     print(f"Scanning for '{name}'...", flush=True)
-    device = await BleakScanner.find_device_by_name(name, timeout=timeout)
+    device = await find_node(name, timeout=timeout)
     if device is None:
         raise RuntimeError(f"Device '{name}' not found. Is it powered on and advertising?")
     print(f"Found: {device.address}", flush=True)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Battery diagnostic for HarnessNode (nordic-main / StickC Plus SE).
+Battery diagnostic for the node (ClaspNode / HarnessNode) (nordic-main / StickC Plus SE).
 Connects via BLE and reads Battery Service (0x180F) + dumps all services.
 """
 
@@ -8,6 +8,7 @@ import argparse
 import asyncio
 import sys
 from bleak import BleakClient, BleakScanner
+from node_names import NODE_NAME, find_node
 
 BATTERY_SERVICE_UUID = "0000180f-0000-1000-8000-00805f9b34fb"
 BATTERY_LEVEL_UUID = "00002a19-0000-1000-8000-00805f9b34fb"
@@ -15,23 +16,15 @@ BATTERY_LEVEL_UUID = "00002a19-0000-1000-8000-00805f9b34fb"
 
 async def find_device(name: str, timeout: float):
     print(f"Scanning for '{name}'...")
-    device = await BleakScanner.find_device_by_name(name, timeout=timeout)
-    if device is not None:
-        return device
-    if name != "HarnessNode":
-        return None
-    print("Exact name missed; scanning HarnessNode* ...")
-    devices = await BleakScanner.discover(timeout=timeout)
-    for d in devices:
-        if d.name and d.name.startswith("HarnessNode"):
-            return d
-    return None
+    # A brand name (ClaspNode / HarnessNode) matches either brand and -Variant suffixes;
+    # any other name is matched exactly.
+    return await find_node(name, timeout=timeout)
 
 
 async def main():
     parser = argparse.ArgumentParser(description="Read BLE Battery Service")
-    parser.add_argument("--device", default="HarnessNode",
-                        help="BLE advertised name (default: HarnessNode)")
+    parser.add_argument("--device", default=NODE_NAME,
+                        help="BLE advertised name (default: ClaspNode; ClaspNode / HarnessNode match either)")
     parser.add_argument("--timeout", type=float, default=10.0)
     args = parser.parse_args()
 
