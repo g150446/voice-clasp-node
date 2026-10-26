@@ -102,9 +102,13 @@ Plus2 と同じ音声 UUID / パケット。
 |------|------|
 | 未購読で BtnA **single** / serial `c` | 未接続なら `ADV`。GAP のみなら切って再広告 |
 | Handy 接続中に BtnA **single** / serial `c` | 録音トグル。TX `0x14` のあと `0x01` or `0x02` |
+| Voice Clasp が RX `0x08 0x01` を送った後 | **notify-only**。録音はトグルせず TX `0x14` のみ |
 | BtnA **double** / serial `d` | TX `0x12` のみ |
 | BtnB **short** / serial `a` | 切断して `ADV` |
 | BtnA **≥1 s** / serial `l` | deep sleep。同じ BtnA で起床して `ADV` |
+| RX `0x01` / `0x00` | ホスト start / stop |
+| RX `0x05 mode` | モード（0=NORMAL, 1=DRIVING）。TX `0x40` |
+| RX `0x08 0/1` | タップ権限。0=ローカルトグル（既定・Handy）、1=notify-only。切断で 0 に戻る |
 
 ### LCD
 

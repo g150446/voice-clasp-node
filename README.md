@@ -103,7 +103,7 @@ idf.py -DHN_BOARD=stickc_plus2 -p /dev/cu.usbserial-XXXX flash monitor
 ```
 
 - BLE name: `HarnessNode-Plus2`（Handy 互換 UUID）
-- BtnA single = 録音トグル、double = `0x12` のみ
+- BtnA single = 録音トグル、double = `0x12` のみ。Voice Clasp が RX `0x08 0x01` を送ると single は notify-only になる
 - BLE OTA: `./stickc_plus2/build_and_package_ota.sh` のあと  
   `python3 mac_client/ota_updater.py --device HarnessNode-Plus2 stickc_plus2/ota_update.bin`
 - 詳細: [`docs/stickc_plus2_guide.md`](docs/stickc_plus2_guide.md)
@@ -512,7 +512,7 @@ python3 serial_monitor.py --reset
 Same Handy-compatible click semantics on both M5 firmwares:
 
 - `r` / `s`: recording start / stop
-- `c` / `1`: single-click (`0x14`; toggles recording while connected)
+- `c` / `1`: single-click (`0x14`; toggles recording while connected, notify-only after RX `0x08 0x01`)
 - `d` / `2`: double-click (`0x12`; notify only)
 - `a`: Plus SE BtnB — drop link and advertise
 - `h`: help

@@ -80,10 +80,12 @@ python3 mac_client/ota_updater.py --device HarnessNode-Plus2 stickc_plus2/ota_up
 | 入力 | 動作 |
 |------|------|
 | BtnA **single** / serial `c` | BLE 接続中に録音トグル。TX `0x14` のあと `0x01` or `0x02` |
+| Voice Clasp が RX `0x08 0x01` を送った後 | **notify-only**。録音はトグルせず TX `0x14` のみ |
 | BtnA **double** / serial `d` | TX `0x12` のみ（録音しない） |
 | BtnA **≥1 s 長押し** / serial `l` | deep sleep 入眠（LCD 消灯・BLE 切断）。**同じ BtnA を押すだけで起床**（電源ボタン不要） |
 | RX `0x01` / `0x00` | ホスト start / stop |
 | RX `0x05 mode` | モード（0=NORMAL, 1=DRIVING）。TX `0x40` |
+| RX `0x08 0/1` | タップ権限。0=ローカルトグル（既定・Handy）、1=notify-only。切断で 0 に戻る |
 | 音声 | 16 kHz mono PCM `[seq][0xAA][i16 LE…]`、ペイロード最大 200 B |
 
 ### 起動表示 / スリープ

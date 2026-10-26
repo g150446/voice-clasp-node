@@ -94,6 +94,9 @@ static const char *TAG = "hn_plusse";
 #define EVENT_DOUBLE_CLICK 0x12
 #define EVENT_SINGLE_CLICK 0x14
 #define COMMAND_SET_OPERATION_MODE 0x05
+/* Voice Clasp asks for notify-only taps so the Android host authorizes
+ * recording with RX 0x01/0x00. Default off keeps the Handy single-click toggle. */
+#define COMMAND_SET_TAP_NOTIFY_ONLY 0x08
 #define EVENT_OPERATION_MODE 0x40
 #define OPERATION_MODE_NORMAL 0x00
 #define OPERATION_MODE_DRIVING 0x01
@@ -148,6 +151,9 @@ static volatile bool stop_requested = false;
 static volatile bool stop_event_pending = false;
 static volatile uint8_t operation_mode = OPERATION_MODE_NORMAL;
 static volatile uint8_t operation_mode_pending = OPERATION_MODE_PENDING_NONE;
+/* Set by Voice Clasp: single-click only notifies, never toggles recording.
+ * RAM only and cleared on disconnect so a later Handy session keeps its toggle. */
+static volatile bool tap_notify_only = false;
 
 /* Which code owns the PDM clock.
  *
@@ -335,6 +341,14 @@ static void emulate_single_click(const char *source)
         }
         ESP_LOGI(TAG, "%s: start advertising", source);
         ble_app_advertise();
+        return;
+    }
+
+    if (tap_notify_only) {
+        /* Voice Clasp host owns tap semantics: it answers the tap with
+         * RX 0x01/0x00 (or G2 paging) instead of a local toggle. */
+        ESP_LOGI(TAG, "%s: notify-only (host authorizes recording)", source);
+        send_status_event(EVENT_SINGLE_CLICK, "single_click");
         return;
     }
 
@@ -775,6 +789,10 @@ audio_gatt_svr_access(uint16_t conn_handle, uint16_t attr_handle,
                     ESP_LOGW(TAG, "Invalid operation mode: %u", requested);
                     send_operation_mode_status();
                 }
+            } else if (cmd == COMMAND_SET_TAP_NOTIFY_ONLY && data_len >= 2) {
+                tap_notify_only = (data[1] != 0);
+                ESP_LOGI(TAG, "Tap notify-only: %s",
+                         tap_notify_only ? "ON (host authorizes)" : "OFF (local toggle)");
             }
         }
         return 0;
@@ -1009,6 +1027,7 @@ ble_app_gap_event(struct ble_gap_event *event, void *arg)
         peer_present = false;
         memset(peer_mac, 0, sizeof(peer_mac));
         display_set_peer(NULL, false, false);
+        tap_notify_only = false;
         is_recording = false;
         recording_requested = false;
         stop_requested = false;
