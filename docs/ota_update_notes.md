@@ -294,3 +294,9 @@
   `ADV_NO_CONN_SLEEP_MS`）。トレードオフ: 5分超の切断はタップで起床が必要。
   USB接続中は入眠しない仕様（`unconnected_since_ms`固定）とawake中の25 ms poll床は変更せず、
   恒常的な床を下げるには未接続時INT1起床化（Phase 2）が必要。実機の入眠/起床検証は次段。
+- 2026-10-26: 0.0.117（BLE広告名を `HarnessNode` から `ClaspNode` へ変更。機能の変更なし）をビルド・OTA。
+  先にアプリと `mac_client` を新旧両名対応にしてから更新した（`ota_updater.py` の更新後の検証は
+  どちらの名前でも探す）。264027 B を 50.9 s（5.1 KB/s）でアップロード。slot 0 `active=true` /
+  `confirmed=true` / version=`0.0.117` / hash=`c10f047c536cc3ac` を確認済み（直前の 0.0.116 は
+  slot 1 へ）。更新後、Android が**同じ MAC**（`CF:78:E0:AC:05:04`）で `ClaspNode` として再接続し、
+  優先デバイスの照合も通った。
