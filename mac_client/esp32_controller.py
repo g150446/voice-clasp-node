@@ -31,12 +31,18 @@ except ImportError:
 # ============================================================================
 
 # BLE Device names
-DEVICE_NAMES = ("VoiceBridge", "AtomEchoS3R")
+DEVICE_NAMES = (
+    "VoiceBridge",
+    "AtomEchoS3R",
+    "HarnessNode-Echo",
+    "HarnessNode-Plus2",
+    "HarnessNode",
+)
 
-# BLE Service and Characteristic UUIDs
-SERVICE_UUID = "00000000-0000-0000-0000-000000000000"
-TX_CHARACTERISTIC_UUID = "00000002-0000-1000-8000-00805f9b34fb"  # XIAO -> Mac (Notify)
-RX_CHARACTERISTIC_UUID = "00000003-0000-1000-8000-00805f9b34fb"  # Mac -> XIAO (Write)
+# BLE Service and Characteristic UUIDs (HarnessNode-compatible)
+SERVICE_UUID = "00000001-0000-1000-8000-00805f9b34fb"
+TX_CHARACTERISTIC_UUID = "00000002-0000-1000-8000-00805f9b34fb"  # device -> Mac (Notify)
+RX_CHARACTERISTIC_UUID = "00000003-0000-1000-8000-00805f9b34fb"  # Mac -> device (Write)
 
 # BLE configuration
 BLE_MTU_SIZE = 512
@@ -46,6 +52,9 @@ DEFAULT_SAMPLE_RATE = 24000
 DEVICE_SAMPLE_RATES = {
     "VoiceBridge": 24000,
     "AtomEchoS3R": 16000,
+    "HarnessNode-Echo": 16000,
+    "HarnessNode-Plus2": 16000,
+    "HarnessNode": 16000,
 }
 SAMPLE_WIDTH = 2  # 16-bit
 CHANNELS = 1
@@ -306,6 +315,16 @@ class VoiceBridgeClient:
             logger.info("Device event: recording stopped")
             if self.recorder.is_recording:
                 self.recorder.stop_recording()
+        elif event_code == 0x14:
+            logger.info("Device event: single_tap/click (FW toggles recording)")
+        elif event_code == 0x12:
+            logger.info("Device event: double_tap/click (notify only)")
+        elif event_code == 0x40 and len(payload) >= 3:
+            logger.info(
+                "Device event: operation_mode effective=%u pending=%u",
+                payload[1],
+                payload[2],
+            )
         else:
             logger.info("Device event: unknown code 0x%02X", event_code)
 

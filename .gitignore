@@ -116,3 +116,12 @@ Makefile
 *.o
 *.a
 *.d
+
+# Generated OTA payloads / stale IDF trees
+**/ota_update.bin
+build.old.*/
+build.pre_ota.*/
+sdkconfig.bak.*
+sdkconfig.old.*
+sdkconfig.pre_ota.*
+dependencies.lock.old.*

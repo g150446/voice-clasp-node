@@ -16,7 +16,7 @@
 | IMU | LSM6DS3TR-C（加速度 ODR 416 Hz。ジャイロはオンデマンド 104 Hz） |
 | 音声フォーマット | 16 kHz / 16-bit / モノラル PCM |
 | LED 方針 | 起動後は待機時消灯。録音ジェスチャー成立後の録音中のみ赤 |
-| 署名バージョン（目安） | `0.0.77+`（single_tap `0x14` とdouble回帰修正を含む） |
+| 署名バージョン（目安） | `0.0.90+`（TAP_SRC遅延読み出しによるタップ判定修正、`0xD0`定期配信の停止、`0x40`の全接続配信、接続時通知の購読待ちを含む） |
 | OTA 手順 | [`ota_update_notes.md`](ota_update_notes.md) |
 | Android single_tap | `0x14`を診断ログへ記録（Kindle/G2操作はdouble専用） |
 
@@ -135,6 +135,13 @@ west build -p always --sysbuild -b xiao_ble/nrf52840/sense \
 |---------|------|
 | `0x01` | 録音開始 |
 | `0x00` | 録音停止 |
+| `0x50 [reg] [val]` | IMUレジスタ書き込み（タップ関連のみ許可。`0xD2`で応答） |
+| `0x51 [reg]` | IMUレジスタ読み出し（`0xD2`で応答） |
+
+`0x50` / `0x51` はタップ調整用の診断コマンド。書き込みは `CTRL1_XL` `CTRL6_C`
+`CTRL10_C` `TAP_CFG` `TAP_THS_6D` `INT_DUR2` `WAKE_UP_THS` `MD1_CFG` に限定され、
+それ以外は `-EPERM` で拒否する。OTAなしで閾値・軸・Duration を実機で振れるので、
+タップ系の調査はまずこれを使う（`mac_client/tap_monitor.py --write 0x59:0x04` など）。
 
 ### TX パケット形式（ファームウェア → ホスト）
 
@@ -162,10 +169,13 @@ west build -p always --sysbuild -b xiao_ble/nrf52840/sense \
 | `0x11` | `motion_settled` | x, y, z f32 LE + elapsed_ms u32 + avg/peak_speed/distance f32 LE（計 28 bytes） | モーション静定、詳細メトリクス |
 | `0x12` | `double_tap` | なし | リストバンド表側から基板面へ垂直に行ったダブルタップ |
 | `0x14` | `single_tap` | なし | 同上のシングルタップ（間隔窓を超えた単独衝撃） |
-| `0x40` | `operation_mode` | effective mode u8 + pending mode u8 | Android設定モードの同期状態（0=通常、1=運転、0xff=pendingなし） |
+| `0x40` | `operation_mode` | effective mode u8 + pending mode u8 | Android設定モードの同期状態（0=通常、1=運転、0xff=pendingなし）。要求受理時と適用時の2回、**全接続へ**送る |
 | `0x20` | `sleep_enter` | なし | ライトスリープ移行（10 秒無動作） |
 | `0x21` | `sleep_wake` | なし | ライトスリープ復帰（モーション検出） |
 | `0x30` | `gesture_diag` | stage/reason u8 + value1/2/3 f32 LE | USBなしのジェスチャー内部診断 |
+| `0xD0` | `tap_diag` | read_ret i8 + CTRL1_XL/CTRL6_C/TAP_CFG/TAP_THS_6D/INT_DUR2/WAKE_UP_THS/MD1_CFG/INT1_CTRL u8 + nonzero_count u16 LE + int1_level i8 | タップ関連レジスタのスナップショット（接続確立時に1回。任意タイミングの個別読み出しは RX `0x51` → `0xD2`） |
+| `0xD1` | `tap_src_raw` | TAP_SRC u8 + read_ret i8 | 判定に使った生の `TAP_SRC`。タップ1回につき1パケット |
+| `0xD2` | `imu_reg_ack` | reg u8 + 読み戻し値 u8 + ret i8 | RX `0x50` / `0x51` への応答 |
 
 ---
 
@@ -230,9 +240,7 @@ BLE 接続はスリープ中も維持されます。録音停止後もタイマ�
 
 LSM6DS3TR-C のハードウェア判定を使用し、部品面を皮膚側にした装着状態で
 リストバンド表側から基板面へ垂直に行うタップを Z 軸で検出する。
-閾値は約 0.5 g、2 回の最大間隔は約 308 ms、認識後の共有クールダウンは 700 ms。
-`DOUBLE_TAP_EN` 有効時、ファームウェアは1打目のsingle候補を約330ms保留し、窓内の2回目をdoubleとして確定する。
-窓内に2回目がなければsingleを送信する。確定後の連続イベントには700msのクールダウンを適用する。
+閾値は約 0.5 g、2 打の最大間隔（Duration）は約 308 ms、確定後のクールダウンは 700 ms。
 
 | モード | single (`0x14`) | double (`0x12`) |
 |--------|-----------------|-----------------|
@@ -245,6 +253,18 @@ Android は RX characteristic に `[0x05, mode]`（`mode=0` 通常、`mode=1` �
 ライトスリープ中は復帰し、タップが掌上静止開始ジェスチャーとして
 扱われないよう、待機中の開始候補を破棄する（通常モード）。
 
+`0x40` の送信タイミング（`0.0.88+`）:
+
+- **要求を受理した時点**と**実際に適用した時点**の2回送る。受理時のackがないと、
+  録音中に保留された切替をホストが観測できない（`apply_pending_operation_mode()` は
+  録音中に早期returnするため、適用まで何も飛ばなかった）。
+- `notify_all_conns()` で**全接続へ**送る。Mac Handy が primary を握っている間も
+  Android がモードを追えるようにするため（`0.0.87` までは primary 1本にしか飛ばず、
+  secondary の Android には届かなかった）。
+- 接続確立時は primary / secondary のどちらでも現在のモードを1回送る。ただし送信は
+  `ble_connected()` ではなく **メインループが `bt_gatt_is_subscribed()` を見て**行う。
+  詳細は下の「接続時通知は購読完了を待つ」を参照。
+
 #### ハードウェア割り込み構成
 
 この機能は、25 / 50 ms ごとに取得する加速度値からCPUがタップ波形を分類する
@@ -254,24 +274,139 @@ Android は RX characteristic に `[0x05, mode]`（`mode=0` 通常、`mode=1` �
 ```
 リストバンド表側への衝撃
   → LSM6DS3TR-C内蔵判定（Z軸、閾値・Shock・Quiet・Duration）
-  → TAP_SRCに single-tap または double-tap / Z を記録
-  → IMU INT1をassert
-  → XIAO P0.11のGPIO割り込み
-  → メインループでTAP_SRCを確認（double 優先）
+  → 1打目の時点で IMU INT1 をassert（MD1_CFGにsingleも割り当てているため）
+  → XIAO P0.11のGPIO割り込み／メインループでのINT1レベル監視
+  → TAP_SRCには触れずに 350 ms 待つ（TAP_SRC_SETTLE_MS）
+  → HWのDurationが閉じた後に TAP_SRC を1回だけ読む
+  → TAP_IA|DOUBLE|Z なら double、それ以外は single
   → BLE [0x00, 0x55, 0x12] または [0x00, 0x55, 0x14]
 ```
 
 - 基板DTSの `irq-gpios = <&gpio0 11 GPIO_ACTIVE_HIGH>` により、IMU INT1は
   nRF52840のP0.11へ接続される。
 - `INT1_CTRL` の加速度・ジャイロdata-ready割り込みを無効化し、`MD1_CFG` の
-  single-tap と double-tap を INT1 へ割り当てる。割り込み処理はフラグを立てるだけで、
-  I2C読み出しとBLE通知はメインループ側で行う。
+  single-tap と double-tap を INT1 へ割り当てる。INT1に載るのはタップだけなので、
+  **INT1のassertは常に「打撃があった」ことを意味する**。
 - NCS v2.9.2のLSM6DSLドライバはこのセンサーの`SENSOR_TRIG_DOUBLE_TAP`を
   実装していない。そのためtap関連レジスタをI2Cで直接設定し、ドライバの
   `SENSOR_TRIG_DATA_READY`用INT1配送経路をGPIO通知手段として再利用する。
   実際の割り込み源はdata-readyではなく、IMUが判定したタップである。
+- 同ドライバは初期化時に `CTRL6_C.XL_HM_MODE` を無条件でセットし、加速度計を
+  high-performance モードから外す。ST のタップ手順（AN5040）はこれがONである前提
+  なので、`configure_tap_detection()` で明示的にクリアする。
+- ドライバの `lsm6dsl_thread_cb()` は INT1 がラッチでhighのまま
+  `GPIO_INT_EDGE_TO_ACTIVE` を再武装し、`lsm6dsl_trigger_set` と違ってピンレベルを
+  再確認しない。立ち上がりエッジを取りこぼすことがあるため、ファームウェアは
+  **エッジではなくINT1のレベル**もメインループで見る。
 - 初期化に失敗した場合はタップ検出だけを無効化してログへ理由を出し、既存の
   IMUポーリング、録音ジェスチャー、BLE接続は継続する。
+
+#### TAP_SRC を1打目で読んではいけない（0.0.76〜0.0.86 回帰の真因）
+
+`TAP_CFG` は LIR（latched interrupt request）を有効にしている。この状態で
+**Duration の窓が閉じる前に `TAP_SRC` を読むと、ラッチが解除されて進行中の
+ダブルタップ判定が中断される**。
+
+`0.0.76` が `MD1_CFG` に `INT1_SINGLE_TAP`(BIT6) を追加したことで、INT1は
+1打目の時点でassertされるようになった。従来どおりINT1を見て即座に`TAP_SRC`を
+読むと、上記のとおり2打目の判定が壊れる。実測では、ダブルタップが
+`TAP_SRC=0x21`（`SINGLE|Z`、`TAP_IA`は立たない）2発に分解され、
+**`0x12` は一度も送信されなくなった**。`0.0.55`（double専用、`MD1_CFG=0x08`）が
+7/7 PASS していたのは、INT1がダブル確定後にしか上がらず、読み出しが必ず
+事後だったからである。
+
+対策は「INT1が上がってから `TAP_SRC_SETTLE_MS`（350 ms＝HW Duration 308 ms＋
+メインループ25 ms＋余裕）待ってから1回だけ読む」。窓が閉じた後なので、
+レジスタは最終判定を持っている。
+
+実測した `TAP_SRC` の値（FW `0.0.85`〜`0.0.87`、Z軸・0.5 g）:
+
+| 操作 | 350 ms後の `TAP_SRC` | 判定 |
+|------|---------------------|------|
+| ダブルタップ | `0x51` / `0x59`（`TAP_IA\|DOUBLE\|Z`） | double → `0x12` |
+| シングルタップ | `0x00` | single → `0x14` |
+
+このセンサーは `SINGLE_DOUBLE_TAP=1` のとき **`TAP_IA` をダブル確定時にしか
+立てない**。単打では窓が閉じた時点で `TAP_SRC` が `0x00` までクリアされるため、
+シングルを `TAP_IA` でマッチさせることはできない。INT1にタップ以外が載っていない
+ことを利用し、**「INT1が上がった、かつダブルが確定しなかった」＝シングル**と
+推定する。
+
+過去に修正した派生バグも記録しておく（いずれも実在したが、上記が本体）:
+
+- **クールダウン共有（`0.0.76`〜`0.0.80`）**: single と double が1つの
+  タイムスタンプを共有していたため、仮にsingleが先に出ると700 ms間doubleが
+  無言で捨てられた。`0.0.81` で `tap_last_single_ms` / `tap_last_double_ms` に分離。
+  確定タップはすべてsingleのクールダウンを刻むが、doubleのクールダウンを
+  刻めるのはdoubleだけ。クールダウンで捨てたタップは必ず printk する。
+- **毎ループの無条件 `TAP_SRC` ポーリング（`0.0.80`〜`0.0.83`、未リリース）**:
+  ドライバのエッジ取りこぼし対策として入れたものだが、25 ms ごとにラッチを
+  解除するため上記の中断を最悪化させていた。INT1レベル監視＋遅延読み出しに置換。
+
+#### タップ系の診断
+
+USBシリアルなしで実機を追えるよう、タップ経路はBLEへ計装済み。
+
+- `0xD0`（接続確立時に1回、`0.0.88+`。実際の送信は購読完了後、`0.0.90+`）: `CTRL1_XL` `CTRL6_C` `TAP_CFG` `TAP_THS_6D` `INT_DUR2`
+  `WAKE_UP_THS` `MD1_CFG` `INT1_CTRL` の実値、`TAP_SRC`読み出しの戻り値、
+  非ゼロ検出回数、INT1のレベル。レジスタが期待どおりかを一目で確認できる。
+- `0xD1`: 判定に使った生の `TAP_SRC`。どの軸が立ったか、`TAP_IA` / `DOUBLE` /
+  `SINGLE` のどれが立ったかがそのまま読める。
+- RX `0x50` / `0x51`: OTAなしで閾値・軸・Durationを実機で振る。個別レジスタは
+  `0x51` → `0xD2` で任意のタイミングで読めるので、`0xD0` の定期配信は不要。
+
+`0.0.87` までは `0xD0` を2秒周期で全接続へ流していた（真因特定用の計装）。
+帯域は無視できるが、Android の `BleManager` が高レート系以外を全部hexダンプするため
+logcat が2秒ごとに埋まり、Node も2秒ごとにI2Cを8回叩いていた。`0.0.88` で
+接続時1回に変更。
+
+#### 接続時通知は購読完了を待つ（`0.0.90` で修正）
+
+**`ble_connected()` で `bt_gatt_notify()` を呼んでも、その接続した本人には届かない。**
+接続確立からクライアントがTX characteristicのCCCDを書くまで約1秒あり、その間は
+購読者がいないので通知は捨てられる。実測（Android、FW `0.0.88`）:
+
+```
+17:33:49.854  GATT connected            <- ble_connected() はここ
+17:33:51.072  TX notifications enabled  <- CCCD有効化は1.2秒後
+```
+
+`0.0.88` ではこのせいで接続時の `0xD0` と `0x40` がAndroid自身には1件も届かず、
+**別のクライアントが後から接続したときだけ**（既に購読済みなので）現れるという
+紛らわしい挙動になっていた。`0.0.87` までは `0xD0` の2秒周期タイマーが再送していたため
+表面化せず、`send_operation_mode_status()` の方は元から同じ欠陥を抱えていた。
+
+**`BT_GATT_CCC` の `cfg_changed` はこの用途に使えない**（`0.0.89` で試して失敗した）。
+Zephyr の `gatt_ccc_changed()` は全クライアントの**集約値が変化したときだけ**
+コールバックを呼ぶ:
+
+```c
+for (i = 0; i < ARRAY_SIZE(ccc->cfg); i++)
+    if (ccc->cfg[i].value > value) value = ccc->cfg[i].value;
+if (value != ccc->value) { ccc->value = value; ccc->cfg_changed(attr, value); }
+```
+
+つまり既に誰かが購読している状態で2台目が購読しても発火しない。接続ごとの処理には
+使えない。
+
+`0.0.90` の実装: `ble_connected()` は `conn_needs_greeting[slot]` を立てるだけにし、
+メインループ（25 ms周期）の `send_pending_greetings()` が
+**接続ごとに `bt_gatt_is_subscribed(conn, &audio_svc.attrs[2], BT_GATT_CCC_NOTIFY)`**
+を見て、trueになった接続にだけ送る。時間待ちではないので取りこぼしも早すぎる送信もない。
+
+**接続直後に何かを通知したくなったら、`ble_connected()` でもCCCDコールバックでもなく、
+`bt_gatt_is_subscribed()` を接続ごとにポーリングすること。**
+
+正常時の期待値: `CTRL1_XL=0x60` `CTRL6_C=0x00` `TAP_CFG=0x83` `TAP_THS_6D=0x08`
+`INT_DUR2=0x4a` `WAKE_UP_THS=0x80` `MD1_CFG=0x48` `INT1_CTRL=0x00`。
+
+Mac から `mac_client/tap_monitor.py` で観測する（macOSのBluetooth権限の都合で
+Terminal.appから実行すること。詳細は [`ota_update_notes.md`](ota_update_notes.md)）。
+
+```bash
+mac_client/venv/bin/python3 mac_client/tap_monitor.py --duration 60
+mac_client/venv/bin/python3 mac_client/tap_monitor.py --duration 45 --write 0x59:0x04
+```
 
 #### 実機確認結果
 
@@ -285,8 +420,15 @@ Android は RX characteristic に `[0x05, mode]`（`mode=0` 通常、`mode=1` �
 | タップせず腕を自然に上げ下げ | 2 / 2 誤検出なし |
 | 合計 | **7 / 7 PASS** |
 
-single (`0x14`) はファーム `0.0.76` で実装・OTA 済み。検出系の実機再確認は未実施。  
-Android 側の受信・UX は未実装（[`Android未実装_シングルタップイベント対応.md`](Android未実装_シングルタップイベント対応.md)）。
+2026-08-31、ファームウェア`0.0.87`で single / double 同時運用を再確認した
+（Mac直結の `tap_monitor.py` で観測、その後 Android アプリでも受信を確認）。
+
+| 試験 | 結果 |
+|------|------|
+| シングルタップ | 5 / 5 → `0x14` のみ（`TAP_SRC=0x00`） |
+| ダブルタップ | 5 / 5 → `0x12` のみ（`TAP_SRC=0x51`/`0x59`） |
+| 取り違え・誤検出 | 0 件 |
+| 合計 | **10 / 10 PASS** |
 
 ---
 
@@ -487,18 +629,45 @@ python3 gesture_classifier.py
 
 ---
 
-## ジェスチャ履歴デバッグビルド
+## ジェスチャ履歴と IMU 軌跡の収集
 
-本番は `GESTURE_DEBUG_HISTORY=0`（既定）。判定履歴と6軸履歴バッチを有効にするには:
+`0.0.91` から `GESTURE_DEBUG_HISTORY` は**既定 1**（本番ビルドに含む）で、
+実際の収集は**実行時スイッチ**で切り替える。以前のように収集のたびに
+デバッグビルドを OTA する必要はない。
 
-```bash
-# sysbuild の west configure 引数に C フラグを足す
-west build -p always --sysbuild -b xiao_ble/nrf52840/sense \
-  /path/to/voice-clasp-node/nordic-main --build-dir /tmp/voice-clasp-node-debug \
-  -- -DEXTRA_CFLAGS=-DGESTURE_DEBUG_HISTORY=1
-```
+| | |
+|---|---|
+| RX | `CMD_SET_GESTURE_CAPTURE`（`0x06`）＋ `0x00`/`0x01` |
+| TX ack | `EVT_GESTURE_CAPTURE`（`0x39`）、`notify_all_conns()` で全接続へ |
+| 既定 | **OFF**。RAM のみに保持し、リセットで OFF に戻る |
 
-または `nordic-main/src/main.c` の `#ifndef GESTURE_DEBUG_HISTORY` 既定を一時的に `1` にする。
+**RAM にしか持たないので、接続時 greeting でも現在値を送る。**
+アプリ側も接続のたびに再送する。UI にはアプリの意図ではなく Node の報告値を出すこと。
+
+収集 OFF のときは `gesture_trajectory_clear()` が `active` を立てないため、
+push / finish / flush がすべて no-op になる。分岐1つ以外のコストは掛からない。
+
+痩せたビルドが要るときは `-DEXTRA_CFLAGS=-DGESTURE_DEBUG_HISTORY=0`。
+このとき ack は**常に OFF を報告する**（`gesture_capture_effective()`）ので、
+ホストが「オンにしたつもり」で空振りすることはない。
+
+`0x36` の `period_ms` は `MOTION_SAMPLE_INTERVAL_MS`（25）を載せるだけの**公称値**で、
+実サンプル間隔とは一致しない。IMUポーリングはライトスリープ中 `SLEEP_POLL_INTERVAL_MS`
+（50 ms）に落ちるため（`imu_poll_ms`）、静止状態では約51 ms間隔になる。
+解析側は各サンプルの `t_ms` を使い、一定レートを仮定してはいけない。
+
+**軌跡 flush は2スレッドから呼ばれる。** `process_motion_sample()`（main スレッド）と
+録音停止処理（`audio_thread()`）の両方が `flush_gesture_trajectory()` に到達する。
+`flush_trajectory_batch()` はチャンク間で `k_msleep()` するため、`0.0.91` では
+同一ウィンドウが2セッションとして交互に送信された。`0.0.92` で `atomic_cas` の
+実行中ガードを入れた。ここに新しい呼び出し元を足すときは同じ罠に注意すること。
+
+**録音成功時の flush は `send_event_packet(0x02)` の後**（`main.c` の停止処理）。
+ホストは停止イベントを受けた時点ではまだ軌跡を持っていない。約250ms後に届く。
+
+コスト: 静的バッファ 22.5 KB（`gesture_trajectory` / `gesture_host_collection`
+各 10752 B、`gesture_history` 1536 B）。`0.0.91` の実測で RAM 171 KB / 256 KB、
+署名イメージ 253799 B（slot 上限 335872 B）。
 
 履歴有効時は従来の判定履歴 `0x33–0x35` に加え、40 Hzの加速度XYZ・ジャイロXYZを
 `0x36 trajectory_begin`、`0x37 trajectory_chunk`、`0x38 trajectory_end` でバッチ送信する。

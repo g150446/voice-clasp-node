@@ -73,7 +73,7 @@ static const char *TAG = "voice_bridge";
 
 // BLE configuration
 #define BLE_MTU_SIZE      512
-#define BLE_ADV_NAME      "AtomEchoS3R"
+#define BLE_ADV_NAME      "HarnessNode-Echo"
 
 // Recording configuration
 #define RECORDING_PACKET_SIZE  200  // bytes of PCM data per packet (fits in BLE MTU)
@@ -81,17 +81,24 @@ static const char *TAG = "voice_bridge";
 #define EVENT_PACKET_SYNC_BYTE 0x55
 #define EVENT_RECORDING_STARTED 0x01
 #define EVENT_RECORDING_STOPPED 0x02
-#define EVENT_CONVERSATION_TOGGLED 0x03
+#define EVENT_DOUBLE_CLICK 0x12
+#define EVENT_SINGLE_CLICK 0x14
+#define COMMAND_SET_OPERATION_MODE 0x05
+#define EVENT_OPERATION_MODE 0x40
+#define OPERATION_MODE_NORMAL 0x00
+#define OPERATION_MODE_DRIVING 0x01
+#define OPERATION_MODE_PENDING_NONE 0xff
 
-// BLE UUIDs
-static ble_uuid128_t gatt_svr_svc_sec_uuid = BLE_UUID128_INIT(0x00, 0x00, 0x00, 0x00,
-                                                              0x00, 0x00, 0x00, 0x00,
-                                                              0x00, 0x00, 0x00, 0x00,
-                                                              0x00, 0x00, 0x00, 0x00);
-
-#define AUDIO_SERVICE_UUID        0x0001
-#define AUDIO_TX_CHAR_UUID        0x0002  // Microphone -> Mac (Notify)
-#define AUDIO_RX_CHAR_UUID        0x0003  // Mac -> device (Write for control)
+/* Handy / HarnessNode UUIDs (same as nordic-main; LSB-first for NimBLE). */
+static const ble_uuid128_t gatt_svr_svc_uuid =
+    BLE_UUID128_INIT(0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80,
+                     0x00, 0x10, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00);
+static const ble_uuid128_t gatt_svr_tx_uuid =
+    BLE_UUID128_INIT(0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80,
+                     0x00, 0x10, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00);
+static const ble_uuid128_t gatt_svr_rx_uuid =
+    BLE_UUID128_INIT(0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80,
+                     0x00, 0x10, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00);
 
 // UART configuration
 #define UART_PORT_NUM     UART_NUM_0
@@ -119,6 +126,8 @@ static volatile bool is_recording = false;
 static volatile bool recording_requested = false;
 static volatile bool stop_requested = false;
 static volatile bool stop_event_pending = false;
+static volatile uint8_t operation_mode = OPERATION_MODE_NORMAL;
+static volatile uint8_t operation_mode_pending = OPERATION_MODE_PENDING_NONE;
 
 // I2S handle
 static i2s_chan_handle_t i2s_rx_handle = NULL;
@@ -148,6 +157,8 @@ static esp_err_t init_oled(void);
 static void set_system_status(system_status_t status);
 static void set_system_error(const char *reason);
 static void send_status_event(uint8_t event_code, const char *event_name);
+static void send_operation_mode_status(void);
+static void apply_pending_operation_mode(void);
 static esp_err_t write_i2c_register(uint8_t dev_addr, uint8_t reg_addr, uint8_t value);
 static esp_err_t write_i2c_bulk_data(uint8_t dev_addr, const uint8_t *data);
 static esp_err_t set_microphone_enabled(bool enabled);
@@ -179,21 +190,31 @@ static void request_recording_stop(const char *source)
 
 static void emulate_single_click(const char *source)
 {
-    ESP_LOGI(TAG, "%s: Emulating single-click", source);
-    if (is_recording || recording_requested) {
+    ESP_LOGI(TAG, "%s: Single-click", source);
+
+    /* Single click toggles recording in every operation mode (FW-owned). */
+    if (audio_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+        ESP_LOGW(TAG, "%s: Single-click ignored: no BLE connection", source);
+        return;
+    }
+
+    if (is_recording) {
         request_recording_stop(source);
+    } else if (recording_requested) {
+        recording_requested = false;
+        ESP_LOGI(TAG, "%s: Pending recording start cancelled", source);
+        apply_pending_operation_mode();
     } else {
         request_recording_start(source);
     }
+
+    send_status_event(EVENT_SINGLE_CLICK, "single_click");
 }
 
 static void emulate_double_click(const char *source)
 {
-    ESP_LOGI(TAG, "%s: Emulating double-click", source);
-    if (is_recording || recording_requested) {
-        request_recording_stop(source);
-    }
-    send_status_event(EVENT_CONVERSATION_TOGGLED, "conversation_toggled");
+    ESP_LOGI(TAG, "%s: Double-click (notify only, no recording toggle)", source);
+    send_status_event(EVENT_DOUBLE_CLICK, "double_click");
 }
 
 static void handle_serial_command(uint8_t command, const char *source)
@@ -436,6 +457,64 @@ static void send_status_event(uint8_t event_code, const char *event_name)
     ESP_LOGI(TAG, "Sent status event: %s", event_name);
 }
 
+static void send_operation_mode_status(void)
+{
+    if (audio_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+        return;
+    }
+
+    const uint8_t packet[] = {
+        0x00,
+        EVENT_PACKET_SYNC_BYTE,
+        EVENT_OPERATION_MODE,
+        operation_mode,
+        operation_mode_pending,
+    };
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(packet, sizeof(packet));
+    if (om == NULL) {
+        ESP_LOGW(TAG, "Failed to allocate operation mode status buffer");
+        return;
+    }
+
+    int rc = ble_gattc_notify_custom(audio_conn_handle, audio_tx_char_handle, om);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "Failed to send operation mode status: rc=%d", rc);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Sent operation mode status: effective=%u pending=%u",
+             operation_mode, operation_mode_pending);
+}
+
+static void apply_pending_operation_mode(void)
+{
+    uint8_t requested = operation_mode_pending;
+
+    if (requested == OPERATION_MODE_PENDING_NONE) {
+        return;
+    }
+    if (requested == operation_mode) {
+        operation_mode_pending = OPERATION_MODE_PENDING_NONE;
+        send_operation_mode_status();
+        return;
+    }
+    if (requested != OPERATION_MODE_NORMAL &&
+        requested != OPERATION_MODE_DRIVING) {
+        operation_mode_pending = OPERATION_MODE_PENDING_NONE;
+        send_operation_mode_status();
+        return;
+    }
+    if (is_recording || recording_requested) {
+        return;
+    }
+
+    operation_mode = requested;
+    operation_mode_pending = OPERATION_MODE_PENDING_NONE;
+    ESP_LOGI(TAG, "Operation mode: %s",
+             operation_mode == OPERATION_MODE_DRIVING ? "DRIVING" : "NORMAL");
+    send_operation_mode_status();
+}
+
 static esp_err_t write_i2c_register(uint8_t dev_addr, uint8_t reg_addr, uint8_t value)
 {
     uint8_t payload[] = {reg_addr, value};
@@ -598,45 +677,68 @@ static int
 audio_gatt_svr_access(uint16_t conn_handle, uint16_t attr_handle,
                       struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
-    uint16_t uuid = ble_uuid_u16(ctxt->chr->uuid);
+    (void)conn_handle;
+    (void)attr_handle;
+    (void)arg;
 
-    switch (uuid) {
-    case AUDIO_RX_CHAR_UUID:
-        ESP_LOGD(TAG, "Received control command, len=%d", ctxt->om->om_len);
-        if (ctxt->om->om_len >= 1) {
-            uint8_t cmd = ctxt->om->om_data[0];
+    if (ble_uuid_cmp(ctxt->chr->uuid, &gatt_svr_rx_uuid.u) == 0) {
+        ESP_LOGD(TAG, "Received control command, len=%d", OS_MBUF_PKTLEN(ctxt->om));
+        if (OS_MBUF_PKTLEN(ctxt->om) >= 1) {
+            uint8_t data[2] = {0};
+            uint16_t data_len = OS_MBUF_PKTLEN(ctxt->om) < sizeof(data)
+                                    ? OS_MBUF_PKTLEN(ctxt->om)
+                                    : sizeof(data);
+            if (os_mbuf_copydata(ctxt->om, 0, data_len, data) != 0) {
+                return BLE_ATT_ERR_UNLIKELY;
+            }
+
+            uint8_t cmd = data[0];
             if (cmd == 0x01) {
                 request_recording_start("BLE");
             } else if (cmd == 0x00) {
                 request_recording_stop("BLE");
+            } else if (cmd == COMMAND_SET_OPERATION_MODE && data_len >= 2) {
+                uint8_t requested = data[1];
+                if (requested == OPERATION_MODE_NORMAL ||
+                    requested == OPERATION_MODE_DRIVING) {
+                    operation_mode_pending = requested;
+                    ESP_LOGI(TAG, "Operation mode request: %s%s",
+                             requested == OPERATION_MODE_DRIVING ? "DRIVING" : "NORMAL",
+                             (is_recording || recording_requested) ? " (pending)" : "");
+                    send_operation_mode_status();
+                    apply_pending_operation_mode();
+                } else {
+                    ESP_LOGW(TAG, "Invalid operation mode: %u", requested);
+                    send_operation_mode_status();
+                }
             }
         }
-        break;
-    case AUDIO_TX_CHAR_UUID:
-        ESP_LOGD(TAG, "TX characteristic accessed");
-        break;
-    default:
-        return BLE_ATT_ERR_UNLIKELY;
+        return 0;
     }
 
-    return 0;
+    if (ble_uuid_cmp(ctxt->chr->uuid, &gatt_svr_tx_uuid.u) == 0) {
+        ESP_LOGD(TAG, "TX characteristic accessed");
+        return 0;
+    }
+
+    return BLE_ATT_ERR_UNLIKELY;
 }
 
 static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
     {
         .type = BLE_GATT_SVC_TYPE_PRIMARY,
-        .uuid = &gatt_svr_svc_sec_uuid.u,
+        .uuid = &gatt_svr_svc_uuid.u,
         .characteristics = (struct ble_gatt_chr_def[]) {
             {
-                .uuid = BLE_UUID16_DECLARE(AUDIO_TX_CHAR_UUID),
+                .uuid = &gatt_svr_tx_uuid.u,
                 .access_cb = audio_gatt_svr_access,
                 .flags = BLE_GATT_CHR_F_NOTIFY,
                 .val_handle = &audio_tx_char_handle,
             },
             {
-                .uuid = BLE_UUID16_DECLARE(AUDIO_RX_CHAR_UUID),
+                .uuid = &gatt_svr_rx_uuid.u,
                 .access_cb = audio_gatt_svr_access,
-                .flags = BLE_GATT_CHR_F_WRITE_NO_RSP,
+                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
                 .val_handle = &audio_rx_char_handle,
             },
             {
@@ -663,14 +765,31 @@ ble_app_advertise(void)
     adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
     adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
 
-    int rc = ble_gap_adv_set_fields(&(const struct ble_hs_adv_fields){
-        .name = (uint8_t *)BLE_ADV_NAME,
-        .name_len = strlen(BLE_ADV_NAME),
-        .name_is_complete = 1,
-        .flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP,
-    });
+    /* Adv holds flags + service UUID; full name is in the scan response
+     * (31-byte adv limit cannot fit both "HarnessNode-Echo" and UUID128). */
+    ble_uuid128_t adv_uuids128[] = { gatt_svr_svc_uuid };
+    struct ble_hs_adv_fields fields;
+    memset(&fields, 0, sizeof(fields));
+    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+    fields.uuids128 = adv_uuids128;
+    fields.num_uuids128 = 1;
+    fields.uuids128_is_complete = 1;
+
+    int rc = ble_gap_adv_set_fields(&fields);
     if (rc != 0) {
         ESP_LOGE(TAG, "Error setting adv fields: %d", rc);
+        set_system_status(SYSTEM_STATUS_ERROR);
+        return;
+    }
+
+    struct ble_hs_adv_fields rsp_fields;
+    memset(&rsp_fields, 0, sizeof(rsp_fields));
+    rsp_fields.name = (uint8_t *)BLE_ADV_NAME;
+    rsp_fields.name_len = strlen(BLE_ADV_NAME);
+    rsp_fields.name_is_complete = 1;
+    rc = ble_gap_adv_rsp_set_fields(&rsp_fields);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "Error setting scan rsp fields: %d", rc);
         set_system_status(SYSTEM_STATUS_ERROR);
         return;
     }
@@ -728,6 +847,7 @@ ble_app_gap_event(struct ble_gap_event *event, void *arg)
         recording_requested = false;
         stop_requested = false;
         stop_event_pending = false;
+        apply_pending_operation_mode();
         set_system_status(SYSTEM_STATUS_READY);
         ble_app_advertise();
         break;
@@ -740,6 +860,9 @@ ble_app_gap_event(struct ble_gap_event *event, void *arg)
         if (event->subscribe.attr_handle == audio_tx_char_handle) {
             ESP_LOGI(TAG, "Client %s notifications",
                      event->subscribe.cur_notify ? "enabled" : "disabled");
+            if (event->subscribe.cur_notify) {
+                send_operation_mode_status();
+            }
         }
         break;
     }
@@ -896,6 +1019,7 @@ static void audio_stream_task(void *pvParameters)
             }
             stop_requested = false;
             stop_event_pending = false;
+            apply_pending_operation_mode();
         }
 
         // Read from I2S RX
@@ -1156,6 +1280,7 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Voice Bridge BLE - Initialization complete");
     ESP_LOGI(TAG,
-             "Button A toggles real-time recording; serial commands: "
-             "'r'=start, 's'=stop, 'c'/'1'=single-click, 'd'/'2'=double-click, 'h'=help");
+             "Adv name %s; single-click toggles recording; serial: "
+             "'r'=start, 's'=stop, 'c'/'1'=single-click, 'd'/'2'=double-click, 'h'=help",
+             BLE_ADV_NAME);
 }

@@ -111,4 +111,11 @@
 				<NRF_PSEL(PDM_DIN, 1, 13)>;
 		};
 	};
+
+	pdm20_sleep: pdm20_sleep {
+		group1 {
+			psels = <NRF_PSEL_DISCONNECTED(PDM_CLK)>,
+				<NRF_PSEL_DISCONNECTED(PDM_DIN)>;
+		};
+	};
 };

@@ -76,7 +76,8 @@
 
 &pdm20 {
 	pinctrl-0 = <&pdm20_default>;
-	pinctrl-names = "default";
+	pinctrl-1 = <&pdm20_sleep>;
+	pinctrl-names = "default", "sleep";
 	clock-source = "PCLK32M";
 };
 

@@ -11,11 +11,19 @@ Supports:
 - **XIAO ESP32S3 Sense** (ESP-IDF)
 - **XIAO nRF52840 Sense** (Zephyr/NCS) — `nordic-main`（現行: ジェスチャー録音 + OTA + Battery Service）
 - **XIAO nRF54L15 Sense** (Zephyr/NCS) - Latest!
+- **M5StickC Plus2** (ESP-IDF) — `stickc_plus2/` BLE name `HarnessNode-Plus2`（BtnA single で録音トグル）
+- **M5StickC Plus SE** (ESP-IDF) — `stickc_plus_se/` BLE name `HarnessNode-PlusSE`（Plus2 相当 + 残量 LCD / BAS）
+- **M5 Atom Echo S3R** (ESP-IDF, reserved) — `atom_echo_s3r/`
 
 ## Project Structure
 
 ```
 voice-clasp-node/
+├── stickc_plus2/              # ESP-IDF: M5StickC Plus2 (HarnessNode-Plus2)
+├── stickc_plus_se/            # ESP-IDF: M5StickC Plus SE (HarnessNode-PlusSE)
+├── atom_echo_s3r/             # ESP-IDF: Atom Echo S3R (reserved)
+├── docs/stickc_plus2_guide.md # Plus2 build/flash notes
+├── docs/stickc_plus_se_guide.md # Plus SE (AXP192 / 4MB / battery)
 ├── esp32s3/                   # ESP-IDF firmware (ESP32S3)
 │   ├── main.c                 # Main application
 │   ├── adpcm.c/h              # IMA ADPCM codec
@@ -53,6 +61,10 @@ voice-clasp-node/
 │   ├── build_and_flash.sh     # Build + USB flash + OTA payload helper
 │   ├── build_and_package_ota.sh # Build + OTA payload helper (no USB flash)
 │   └── flash.sh               # Compatibility wrapper to build_and_flash.sh
+├── pdm_power_test/            # nRF54L15: IMU継続中のPDMマイク省電力実測
+│   ├── README.md              # 目的、状態シーケンス、判定基準
+│   ├── MEASURE.md             # 測定器別の接続・記録手順
+│   └── build_and_flash.sh     # NCS v2.9.2 build + CMSIS-DAP flash
 ├── boards/seeed/xiao_nrf54l15/ # Custom XIAO nRF54L15 board definition
 ├── mac_client/                # Mac Python client (shared)
 │   ├── nrf52_voice_client.py  # HarnessNode BLE クライアント（自動録音、ジェスチャーイベント表示）
@@ -80,6 +92,47 @@ voice-clasp-node/
 ### For XIAO ESP32S3 Sense
 
 See `esp32s3/` or the ESP-IDF section below.
+
+### For M5StickC Plus2 — HarnessNode-Plus2 (`stickc_plus2`)
+
+```bash
+source ~/esp/esp-idf/export.sh
+cd voice-clasp-node
+idf.py -DHN_BOARD=stickc_plus2 set-target esp32
+idf.py -DHN_BOARD=stickc_plus2 build
+idf.py -DHN_BOARD=stickc_plus2 -p /dev/cu.usbserial-XXXX flash monitor
+```
+
+- BLE name: `HarnessNode-Plus2`（Handy 互換 UUID）
+- BtnA single = 録音トグル、double = `0x12` のみ。Voice Clasp が RX `0x08 0x01` を送ると single は notify-only になる
+- BLE OTA: `./stickc_plus2/build_and_package_ota.sh` のあと  
+  `python3 mac_client/ota_updater.py --device HarnessNode-Plus2 stickc_plus2/ota_update.bin`
+- 詳細: [`docs/stickc_plus2_guide.md`](docs/stickc_plus2_guide.md)
+
+### For M5StickC Plus SE — HarnessNode-PlusSE (`stickc_plus_se`)
+
+Plus2 と電源・LCD ピン・Flash が違う。**`-B build-plus_se` を使う**（Plus2 の 8MB `build/` と混ぜない）。
+
+```bash
+source ~/esp/esp-idf/export.sh
+cd voice-clasp-node
+idf.py -DHN_BOARD=stickc_plus_se -B build-plus_se set-target esp32
+idf.py -DHN_BOARD=stickc_plus_se -B build-plus_se build
+idf.py -DHN_BOARD=stickc_plus_se -B build-plus_se -p /dev/cu.usbserial-XXXX flash monitor
+```
+
+- BLE name: `HarnessNode-PlusSE`
+- 未接続は **deep sleep** か **`ADV`** のみ。電池起動は睡眠、USB／BtnA 起床は `ADV`
+- Handy 切断・BtnB 短押しで `ADV`。幽霊接続は 15 秒で蹴って睡眠
+- LCD 上部に残量 %、BLE Battery Service `0x180F`。FTDI フラッシュは **115200**
+- 赤 LED（G10 **active-low**）は **録音中のみ点灯**。コネクテッド／待機は消灯
+- BGM 低音対策: **200 Hz HPF 既定 ON**（serial `f` でトグル、0.1.9〜）
+- BLE OTA: `./stickc_plus_se/build_and_package_ota.sh` のあと  
+  `python3 mac_client/ota_updater.py --device HarnessNode-PlusSE stickc_plus_se/ota_update.bin`
+- 詳細: [`docs/stickc_plus_se_guide.md`](docs/stickc_plus_se_guide.md)
+
+Atom Echo S3R（保留）: `HN_BOARD=atom_echo_s3r` + `esp32s3`。  
+[`docs/atom_echo_s3r_guide.md`](docs/atom_echo_s3r_guide.md)
 
 ### For XIAO nRF52840 Sense — HarnessNode (`nordic-main`)
 
@@ -201,7 +254,8 @@ GO後の判定時間は既定15秒。BLE診断の生ログは画面へ出さず�
 グラフは上段が加速度（X/Y/Z、m/s²）、下段がジャイロ角速度（X/Y/Z、dps）です。
 灰色部分はジャイロ未取得期間（掌上0.5秒静止成立前の正常状態）です。
 
-閾値調整前のラベル付き収集には `GESTURE_DEBUG_HISTORY=1` のデバッグビルドを使います。
+閾値調整前のラベル付き収集は、FW `0.0.91+` の IMU収集スイッチ（RX `0x06`）を
+ONにして行います（デバッグビルドの作り直しは不要）。
 推奨する最小構成は左右それぞれの正例3回と負例3回、合計12回です。手順は
 `docs/nordic_main_guide.md` の「ラベル付き6軸データ収集」を参照してください。
 
@@ -223,8 +277,8 @@ cd nrf54l15
 XIAO nRF54L15 は CMSIS-DAP インターフェースのため、pyocd でフラッシュします。
 
 ```bash
-# 前提: NCS v2.9.2, pyocd がインストール済み
-pip install pyocd  # 未インストールの場合
+# 前提: NCS v2.9.2, nRF54L対応のpyOCD 0.37.0以降
+python3 -m pip install 'pyocd>=0.37'  # 未インストールの場合
 
 # ビルド
 export PATH="/opt/nordic/ncs/toolchains/b8efef2ad5/bin:$PATH"
@@ -268,6 +322,12 @@ The working nRF54L15 path now uses a custom XIAO board definition imported from 
 The Seeed XIAO nRF54L15 Sense board shares a single fixed regulator (`pdm_imu_pwr`, GPIO0.1) between the onboard PDM microphone and the LSM6DS3TR-C IMU. Because of this design, **the microphone cannot be powered on or off independently**—whenever the IMU is needed for gesture detection, the microphone is also powered.
 
 This is why the `nrf54-handy/` firmware keeps `pdm_imu_pwr` ON for the entire BLE session (enabling both IMU gesture detection and PDM recording) and turns it OFF only when BLE is disconnected. By contrast, the `nordic-main/` firmware for nRF52840 Sense can toggle microphone power individually via the dedicated `msm261d3526hicpm-c-en` regulator (P1.10), achieving better battery life for gesture-triggered recording use cases.
+
+The standalone [`pdm_power_test/`](pdm_power_test/README.md) app measures whether
+stopping PDM returns current to the IMU-only baseline while keeping the
+accelerometer active at 416 Hz. It compares ordinary STOP, disconnected sleep
+pinctrl, forced-low PDM clock, and device suspend. This is an effective-sleep
+test; it does not claim that microphone VDD can be switched independently.
 
 For details, see `docs/nrf54_power_management.md`.
 
@@ -448,17 +508,24 @@ python3 serial_monitor.py --list
 python3 serial_monitor.py --reset
 ```
 
-On the Atom Echo S3R firmware, the USB serial console at `115200` baud also accepts
-simple control commands:
+### M5 StickC Plus2 / Plus SE / Atom Echo S3R serial (115200)
 
-- `r` / `R`: request recording start
-- `s` / `S`: request recording stop
-- `c` / `C` / `1`: emulate a **single-click**
-- `d` / `D` / `2`: emulate a **double-click**
-- `h` / `H`: print command help
+Same Handy-compatible click semantics on both M5 firmwares:
 
-This is useful for reproducing Handy-side BLE button handling without physically
-pressing the device button.
+- `r` / `s`: recording start / stop
+- `c` / `1`: single-click (`0x14`; toggles recording while connected, notify-only after RX `0x08 0x01`)
+- `d` / `2`: double-click (`0x12`; notify only)
+- `a`: Plus SE BtnB — drop link and advertise
+- `h`: help
+
+| BLE name | Board |
+|----------|--------|
+| `HarnessNode-Plus2` | M5StickC Plus2 (`stickc_plus2/`) |
+| `HarnessNode-PlusSE` | M5StickC Plus SE (`stickc_plus_se/`) |
+| `HarnessNode-Echo` | Atom Echo S3R (`atom_echo_s3r/`, reserved) |
+
+Mode via RX `[0x05, mode]` (`0`=normal, `1`=driving); TX  
+`[0x00, 0x55, 0x40, effective, pending]` (`pending=0xff` = none).
 
 ## Technical Specifications
 
